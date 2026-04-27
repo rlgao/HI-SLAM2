@@ -77,7 +77,8 @@ class Camera(nn.Module):
             focal2fov(K[0], K[-2]),
             focal2fov(K[1], K[-1]),
             K[-1],
-            K[-2])
+            K[-2]
+        )
         cam.R = pose[:3, :3]
         cam.T = pose[:3, 3]
         cam.tstamp = tstamp

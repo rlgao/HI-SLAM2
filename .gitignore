@@ -156,3 +156,6 @@ cache
 data
 figures/*.pdf
 outputs
+
+.codex
+thirdparty/

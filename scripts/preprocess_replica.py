@@ -9,8 +9,10 @@ def to_se3_vec(pose):
     return np.hstack((pose[:3, 3], quat))
 
 
-parent = os.path.dirname(__file__)
-seqs = sorted(glob('data/Replica/room*')) + sorted(glob('data/Replica/office*'))
+# parent = os.path.dirname(__file__)
+# seqs = sorted(glob('data/Replica/room*')) + sorted(glob('data/Replica/office*'))
+seqs = sorted(glob('/home/grl/datasets/replica/room*')) + sorted(glob('/home/grl/datasets/replica/office*'))
+
 for seq in seqs:
     print(seq)
 
@@ -21,8 +23,9 @@ for seq in seqs:
     
     for color, depth in zip(glob(f'{seq}/results/frame*'), glob(f'{seq}/results/depth*')):
         # print(color)
-        os.symlink(f'../results/{os.path.basename(color)}', color.replace('results', 'colors'))
-        os.symlink(f'../results/{os.path.basename(depth)}', depth.replace('results', 'depths'))
+        # print(depth)
+        os.symlink(color, color.replace('results', 'colors'))
+        os.symlink(depth, depth.replace('results', 'depths'))
 
     traj = np.loadtxt(f"{seq}/traj.txt").reshape(-1, 4, 4)
     traj_tum = [np.hstack(([i], to_se3_vec(p))) for i, p in enumerate(traj)]

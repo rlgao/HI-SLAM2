@@ -62,8 +62,16 @@ class MotionFilter:
         trans_totensor = transforms.Compose([transforms.Resize((512, 512), antialias=True)])
         im_tensor = trans_totensor(im_tensor).cuda()
         if self.omni_dep is None:
-            self.omni_dep = OmnidataModel('depth', 'pretrained_models/omnidata_dpt_depth_v2.ckpt', device="cuda:0")
-            self.omni_normal = OmnidataModel('normal', 'pretrained_models/omnidata_dpt_normal_v2.ckpt', device="cuda:0")
+            self.omni_dep = OmnidataModel(
+                'depth', 
+                'pretrained_models/omnidata_dpt_depth_v2.ckpt', 
+                device="cuda:0"
+            )
+            self.omni_normal = OmnidataModel(
+                'normal', 
+                'pretrained_models/omnidata_dpt_normal_v2.ckpt', 
+                device="cuda:0"
+            )
         depth = self.omni_dep(im_tensor)[None] * 50
         depth = F.interpolate(depth, input_size, mode='bicubic')
         depth = depth.float().squeeze()

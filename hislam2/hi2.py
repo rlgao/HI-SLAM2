@@ -62,7 +62,8 @@ class Hi2:
         """ load trained model weights """
         self.net = DroidNet()
         state_dict = OrderedDict([
-            (k.replace("module.", ""), v) for (k, v) in torch.load(weights).items()])
+            (k.replace("module.", ""), v) for (k, v) in torch.load(weights).items()
+        ])
         state_dict["update.weight.2.weight"] = state_dict["update.weight.2.weight"][:2]
         state_dict["update.weight.2.bias"] = state_dict["update.weight.2.bias"][:2]
         state_dict["update.delta.2.weight"] = state_dict["update.delta.2.weight"][:2]
@@ -71,15 +72,17 @@ class Hi2:
         self.net.to("cuda:0").eval()
 
     def call_gs(self, viz_idx, dposes=None, dscale=None):
-        data = {'viz_idx':  viz_idx.to(device='cpu'),
-                'tstamp':   self.video.tstamp[viz_idx].to(device='cpu'),
-                'poses':    self.video.poses[viz_idx].to(device='cpu'),
-                'images':   self.video.images[viz_idx.cpu()],
-                'normals':  self.video.normals[viz_idx.cpu()],
-                'depths':   1./self.video.disps_up[viz_idx.cpu()],
-                'intrinsics':   self.video.intrinsics[viz_idx].to(device='cpu') * 8,
-                'pose_updates':  dposes.to(device='cpu') if dposes is not None else None,
-                'scale_updates': dscale.to(device='cpu') if dscale is not None else None}
+        data = {
+            'viz_idx':  viz_idx.to(device='cpu'),
+            'tstamp':   self.video.tstamp[viz_idx].to(device='cpu'),
+            'poses':    self.video.poses[viz_idx].to(device='cpu'),
+            'images':   self.video.images[viz_idx.cpu()],
+            'normals':  self.video.normals[viz_idx.cpu()],
+            'depths':   1./self.video.disps_up[viz_idx.cpu()],
+            'intrinsics':   self.video.intrinsics[viz_idx].to(device='cpu') * 8,
+            'pose_updates':  dposes.to(device='cpu') if dposes is not None else None,
+            'scale_updates': dscale.to(device='cpu') if dscale is not None else None
+        }
         self.gs.process_track_data(data)
 
     def track(self, tstamp, image, intrinsics=None, is_last=False):
@@ -89,16 +92,25 @@ class Hi2:
             self.images[tstamp] = image
 
             # check there is enough motion
+            # Motion filtering and feature extraction
+            # Keyframe decision
             self.filterx.track(tstamp, image, intrinsics, is_last)
 
             # local bundle adjustment
+            # Frontend local BA
             viz_idx = self.frontend(is_last=is_last)
 
+        # Optional PGBA
         if len(viz_idx) and self.pgba:
             dposes, dscale = self.video.pgobuf.run_pgba(self.LC_data_queue)
             if dposes is not None:
-                self.call_gs(torch.arange(0, self.video.counter.value-1, device='cuda'), dposes[:-1], dscale[:-1])
+                self.call_gs(
+                    torch.arange(0, self.video.counter.value-1, device='cuda'), 
+                    dposes[:-1], 
+                    dscale[:-1]
+                )
 
+        # If frontend returns updated keyframe indices
         if len(viz_idx):
             self.call_gs(viz_idx)
 
@@ -108,7 +120,11 @@ class Hi2:
         if self.pgba:
             dposes, dscale = self.video.pgobuf.run_pgba(self.LC_data_queue)
             if dposes is not None:
-                self.call_gs(torch.arange(0, self.video.counter.value, device='cuda'), dposes, dscale)
+                self.call_gs(
+                    torch.arange(0, self.video.counter.value, device='cuda'),
+                    dposes, 
+                    dscale
+                )
             self.mp_backend.terminate()
         del self.frontend
 
@@ -141,7 +157,18 @@ class Hi2:
                 place = (self.video.tstamp > ind).nonzero()[0].item()
                 self.video.shift(place)
                 depth, normal = self.filterx.prior_extractor(inputs[i])
-                self.video[place] = (ind, images[i], Gs.data[i], self.video.disps[place].mean(), depth.cpu(), normal.cpu(), None, gmap[i], net[i,0], inp[i,0])
+                self.video[place] = (
+                    ind, 
+                    images[i], 
+                    Gs.data[i], 
+                    self.video.disps[place].mean(), 
+                    depth.cpu(), 
+                    normal.cpu(), 
+                    None, 
+                    gmap[i], 
+                    net[i,0], 
+                    inp[i,0]
+                )
         del self.filterx
 
         # global bundle adjustment
@@ -155,10 +182,20 @@ class Hi2:
         torch.cuda.empty_cache()
 
         # final refinement
-        self.call_gs(torch.arange(0, self.video.counter.value, device='cuda'), dposes, dscale)
+        self.call_gs(
+            torch.arange(0, self.video.counter.value, device='cuda'), 
+            dposes, 
+            dscale
+        )
         updated_poses = self.gs.finalize()
         self.video.poses[:self.video.counter.value] = torch.tensor(updated_poses[:,1:])
 
         traj_full = self.traj_filler(self.images)
-        self.gs.eval_rendering(self.images, self.args.gtdepthdir, traj_full.matrix().data, self.video.tstamp[:self.video.counter.value].to(device='cpu'))
+        self.gs.eval_rendering(
+            self.images, 
+            self.args.gtdepthdir, 
+            traj_full.matrix().data, 
+            self.video.tstamp[:self.video.counter.value].to(device='cpu')
+        )
+        
         return traj_full.inv().data.cpu().numpy()

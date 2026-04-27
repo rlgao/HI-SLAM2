@@ -179,6 +179,9 @@ class PGOBuffer:
         self.lcii = torch.as_tensor([], dtype=torch.long, device='cuda')
         self.lcjj = torch.as_tensor([], dtype=torch.long, device='cuda')
 
+    # [Loop Detection]
+    # - Check if current keyframe shares covisibility with non-recent keyframes
+    # - If yes → potential loop closure
     def search_lc_candidate(self, hist, kx):
         ii = torch.arange(0, hist, device='cuda')
         jj = torch.ones_like(ii) * kx

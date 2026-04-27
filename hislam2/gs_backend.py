@@ -99,7 +99,16 @@ class GSBackEnd(mp.Process):
             idx = idx.item()
             idx = packet['tstamp'][i].item()
             tstamp = packet['tstamp'][i].item()
-            viewpoint = Camera.init_from_tracking(packet["images"][i]/255.0, packet["depths"][i], packet["normals"][i], w2c[i], idx, self.projection_matrix, self.K, tstamp)
+            viewpoint = Camera.init_from_tracking(
+                packet["images"][i]/255.0, 
+                packet["depths"][i],
+                packet["normals"][i], 
+                w2c[i], 
+                idx, 
+                self.projection_matrix, 
+                self.K, 
+                tstamp
+            )
             if idx not in self.current_window:
                 self.current_window = [idx] + self.current_window[:-1] if len(self.current_window) > 10 else [idx] + self.current_window
                 if not self.initialized:
@@ -145,9 +154,13 @@ class GSBackEnd(mp.Process):
 
     @torch.no_grad()
     def eval_rendering(self, gtimages, gtdepthdir, traj, kf_idx):
-        eval_rendering(gtimages, gtdepthdir, traj, self.gaussians,self.save_dir, self.background,
-            self.projection_matrix, self.K, kf_idx, iteration="after_opt")
-        eval_rendering_kf(self.viewpoints, self.gaussians, self.save_dir, self.background, iteration="after_opt")
+        eval_rendering(
+            gtimages, gtdepthdir, traj, self.gaussians,self.save_dir, self.background,
+            self.projection_matrix, self.K, kf_idx, iteration="after_opt"
+        )
+        eval_rendering_kf(
+            self.viewpoints, self.gaussians, self.save_dir, self.background, iteration="after_opt"
+        )
 
     def add_next_kf(self, frame_idx, viewpoint, init=False, scale=2.0, depth_map=None):
         self.gaussians.extend_from_pcd_seq(
@@ -230,7 +243,8 @@ class GSBackEnd(mp.Process):
                     render_pkg["visibility_filter"],
                     render_pkg["radii"],
                     render_pkg["depth"],
-                    render_pkg["n_touched"])
+                    render_pkg["n_touched"]
+                )
 
                 loss_mapping += self.lambda_dnormal * get_loss_normal(depth, viewpoint) / 10.
                 loss_mapping += get_loss_mapping_rgbd(self.config, image, depth, viewpoint)

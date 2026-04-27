@@ -23,7 +23,18 @@ def show_image(image, depth_prior, depth, normal):
     image = image[[2,1,0]].permute(1, 2, 0).cpu().numpy()
     depth = colorize_np(np.concatenate((depth_prior.cpu().numpy(), depth.cpu().numpy()), axis=1), range=(0, 4))
     normal = normal.permute(1, 2, 0).cpu().numpy()
-    cv2.imshow('rgb / prior normal / aligned prior depth / JDSA depth', np.concatenate((image / 255.0, (normal[...,[2,1,0]]+1.)/2., depth), axis=1)[::2,::2])
+
+    cv2.imshow(
+        'rgb / prior normal / aligned prior depth / JDSA depth', 
+        np.concatenate(
+            (
+                image / 255.0, 
+                (normal[..., [2, 1, 0]] + 1.) / 2., 
+                depth
+            ), 
+            axis=1
+        )[::2,::2]
+    )
     cv2.waitKey(1)
 
 
@@ -72,7 +83,7 @@ def save_trajectory(hi2, traj_full, imagedir, output, start=0):
     tstamps_full = np.array([float(re.findall(r"[+]?(?:\d*\.\d+|\d+)", x)[-1]) for x in sorted(os.listdir(imagedir))[start:]])[..., np.newaxis]
     tstamps_kf = tstamps_full[tstamps.cpu().numpy().astype(int)]
     ttraj_kf = np.concatenate([tstamps_kf, poses_wc.cpu().numpy()], axis=1)
-    np.savetxt(f"{output}/traj_kf.txt", ttraj_kf)                     #  for evo evaluation 
+    np.savetxt(f"{output}/traj_kf.txt", ttraj_kf)  # for evo evaluation 
     if traj_full is not None:
         ttraj_full = np.concatenate([tstamps_full[:len(traj_full)], traj_full], axis=1)
         np.savetxt(f"{output}/traj_full.txt", ttraj_full)
@@ -103,7 +114,10 @@ if __name__ == '__main__':
 
     hi2 = None
     queue = Queue(maxsize=8)
-    reader = Process(target=mono_stream, args=(queue, args.imagedir, args.calib, args.undistort, args.cropborder, args.start, args.length))
+    reader = Process(
+        target=mono_stream, 
+        args=(queue, args.imagedir, args.calib, args.undistort, args.cropborder, args.start, args.length)
+    )
     reader.start()
 
     N = len(os.listdir(args.imagedir))
@@ -117,14 +131,30 @@ if __name__ == '__main__':
             args.image_size = [image.shape[2], image.shape[3]]
             hi2 = Hi2(args)
 
-        hi2.track(t, image, intrinsics=intrinsics, is_last=is_last)
+        hi2.track(
+            t, 
+            image, 
+            intrinsics=intrinsics, 
+            is_last=is_last
+        )
 
         if args.droidvis and hi2.video.tstamp[hi2.video.counter.value-1] == t:
             from geom.ba import get_prior_depth_aligned
             index = hi2.video.counter.value-2
-            depth_prior, _ = get_prior_depth_aligned(hi2.video.disps_prior_up[index][None].cuda(), hi2.video.dscales[index][None])
-            show_image(image[0], 1./depth_prior.squeeze(), 1./hi2.video.disps_up[index], hi2.video.normals[index])
-        pbar.set_description(f"Processing keyframe {hi2.video.counter.value} gs {hi2.gs.gaussians._xyz.shape[0]}")
+            depth_prior, _ = get_prior_depth_aligned(
+                hi2.video.disps_prior_up[index][None].cuda(), 
+                hi2.video.dscales[index][None]
+            )
+            show_image(
+                image[0],
+                1./depth_prior.squeeze(), 
+                1./hi2.video.disps_up[index],
+                hi2.video.normals[index]
+            )
+            
+        pbar.set_description(
+            f"Processing keyframe No [{hi2.video.counter.value}] with GS num [{hi2.gs.gaussians._xyz.shape[0]}]"
+        )
 
         if is_last:
             pbar.close()
@@ -133,6 +163,12 @@ if __name__ == '__main__':
     reader.join()
 
     traj = hi2.terminate()
-    save_trajectory(hi2, traj, args.imagedir, args.output, start=args.start)
+    save_trajectory(
+        hi2, 
+        traj, 
+        args.imagedir, 
+        args.output, 
+        start=args.start
+    )
 
     print("Done")
