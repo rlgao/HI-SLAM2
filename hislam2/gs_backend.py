@@ -153,13 +153,14 @@ class GSBackEnd(mp.Process):
         return np.stack(poses_cw)
 
     @torch.no_grad()
-    def eval_rendering(self, gtimages, gtdepthdir, traj, kf_idx):
+    def eval_rendering(self, gtimages, gtdepthdir, traj, kf_idx, save_render_depth=False):
         eval_rendering(
             gtimages, gtdepthdir, traj, self.gaussians,self.save_dir, self.background,
             self.projection_matrix, self.K, kf_idx, iteration="after_opt"
         )
         eval_rendering_kf(
-            self.viewpoints, self.gaussians, self.save_dir, self.background, iteration="after_opt"
+            self.viewpoints, self.gaussians, self.save_dir, self.background,
+            iteration="after_opt", save_depth_npy=save_render_depth
         )
 
     def add_next_kf(self, frame_idx, viewpoint, init=False, scale=2.0, depth_map=None):

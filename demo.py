@@ -89,6 +89,32 @@ def save_trajectory(hi2, traj_full, imagedir, output, start=0):
         np.savetxt(f"{output}/traj_full.txt", ttraj_full)
 
 
+def save_dba_depths(hi2, output):
+    depth_dir = os.path.join(output, "dba_depths")
+    os.makedirs(depth_dir, exist_ok=True)
+
+    t = hi2.video.counter.value
+    tstamps = hi2.video.tstamp[:t].cpu().numpy().astype(int)
+    disps = hi2.video.disps_up[:t].cpu().numpy().astype(np.float32)
+    finite = np.isfinite(disps) & (disps > 0)
+    depths = np.zeros_like(disps, dtype=np.float32)
+    depths[finite] = 1.0 / disps[finite]
+
+    for tstamp, depth in zip(tstamps, depths):
+        np.save(os.path.join(depth_dir, f"{int(tstamp):06d}.npy"), depth.astype(np.float32, copy=False))
+    print(f"Saved DBA depth npy files to: {depth_dir}")
+
+
+def parse_bool_arg(value):
+    if isinstance(value, bool):
+        return value
+    if value.lower() in ("true", "1", "yes"):
+        return True
+    if value.lower() in ("false", "0", "no"):
+        return False
+    raise argparse.ArgumentTypeError("expected TRUE or FALSE")
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument("--imagedir", type=str, help="path to image directory")
@@ -104,6 +130,22 @@ if __name__ == '__main__':
 
     parser.add_argument("--droidvis", action="store_true")
     parser.add_argument("--gsvis", action="store_true")
+    parser.add_argument(
+        "--save_dba_depth",
+        nargs="?",
+        const=True,
+        default=False,
+        type=parse_bool_arg,
+        help="save final DBA/SLAM keyframe depths as .npy",
+    )
+    parser.add_argument(
+        "--save_render_depth",
+        nargs="?",
+        const=True,
+        default=False,
+        type=parse_bool_arg,
+        help="save final GS-rendered keyframe depths as .npy",
+    )
 
     parser.add_argument("--start", type=int, default=0, help="start frame")
     parser.add_argument("--length", type=int, default=100000, help="number of frames to process")
@@ -163,6 +205,8 @@ if __name__ == '__main__':
     reader.join()
 
     traj = hi2.terminate()
+    if args.save_dba_depth:
+        save_dba_depths(hi2, args.output)
     save_trajectory(
         hi2, 
         traj, 

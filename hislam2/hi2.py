@@ -195,7 +195,8 @@ class Hi2:
             self.images, 
             self.args.gtdepthdir, 
             traj_full.matrix().data, 
-            self.video.tstamp[:self.video.counter.value].to(device='cpu')
+            self.video.tstamp[:self.video.counter.value].to(device='cpu'),
+            save_render_depth=self.args.save_render_depth
         )
         
         return traj_full.inv().data.cpu().numpy()

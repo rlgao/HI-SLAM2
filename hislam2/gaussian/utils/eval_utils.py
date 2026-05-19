@@ -96,15 +96,22 @@ def eval_rendering_kf(
     save_dir,
     background,
     iteration="final",
+    save_depth_npy=False,
 ):
     psnr_array, ssim_array, lpips_array = [], [], []
     cal_lpips = LearnedPerceptualImagePatchSimilarity(net_type="alex", normalize=True).to("cuda")
+    depth_npy_dir = os.path.join(save_dir, "render_depths")
+    if save_depth_npy:
+        os.makedirs(depth_npy_dir, exist_ok=True)
     for frame in viewpoints.values():
         gtimage = frame.original_image.cuda()
 
         rendering = render(frame, gaussians, background)
         image = (torch.exp(frame.exposure_a)) * rendering["render"] + frame.exposure_b
         image = torch.clamp(image, 0.0, 1.0)
+        if save_depth_npy:
+            depth = rendering["depth"].detach().squeeze().cpu().numpy().astype(np.float32)
+            np.save(os.path.join(depth_npy_dir, f"{int(frame.tstamp):06d}.npy"), depth)
 
         mask = gtimage > 0
         psnr_score = psnr((image[mask]).unsqueeze(0), (gtimage[mask]).unsqueeze(0))
