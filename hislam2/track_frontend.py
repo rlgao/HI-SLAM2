@@ -27,6 +27,30 @@ class TrackFrontend:
         self.frontend_thresh = config["frontend_thresh"]
         self.frontend_radius = config["frontend_radius"]
         self.video.mono_depth_alpha = config["mono_depth_alpha"]
+        scal3r_config = config.get("scal3r_prior", {})
+        self.use_scal3r_prior = bool(config.get("use_scal3r_prior", scal3r_config.get("active", False)))
+        self.min_prior_confidence = float(scal3r_config.get("min_confidence", 0.0))
+        self.min_confident_pixels = int(scal3r_config.get("min_confident_pixels", 128))
+        self.initialize_dscale = str(scal3r_config.get("initialize_dscale", "median_ratio"))
+        if self.initialize_dscale != "median_ratio":
+            raise ValueError("scal3r_prior.initialize_dscale currently supports only 'median_ratio'")
+
+    def _initialize_dscale(self, index):
+        if not self.use_scal3r_prior:
+            self.video.dscales[index] = self.video.disps[index].median() / self.video.disps_prior[index].median()
+            return
+
+        valid = (self.video.disps_prior[index] > 0) & (
+            self.video.disps_prior_conf[index] > self.min_prior_confidence
+        )
+        if valid.sum().item() >= self.min_confident_pixels:
+            disp_median = self.video.disps[index][valid].median()
+            prior_median = self.video.disps_prior[index][valid].median()
+            if torch.isfinite(disp_median).item() and torch.isfinite(prior_median).item() and prior_median.item() > 0:
+                self.video.dscales[index] = disp_median / prior_median
+                return
+
+        self.video.dscales[index] = self.video.disps[index].median() / self.video.disps_prior[index].median()
 
     def __update(self, is_last):
         """ add edges, perform update """
@@ -39,7 +63,7 @@ class TrackFrontend:
         self.graph.add_proximity_factors(self.t1-5, max(self.t1-self.frontend_window, 0), 
             rad=self.frontend_radius, nms=self.frontend_nms, thresh=self.frontend_thresh, remove=True)
 
-        self.video.dscales[self.t1-1] = self.video.disps[self.t1-1].median() / self.video.disps_prior[self.t1-1].median()
+        self._initialize_dscale(self.t1-1)
         for itr in range(self.iters1):
             self.graph.update(None, None, use_inactive=True, use_mono=itr>1)
 
@@ -85,7 +109,7 @@ class TrackFrontend:
         # refine optimization
         self.graph.add_proximity_factors(0, 0, rad=2, nms=2, thresh=self.frontend_thresh, remove=False)
         for i in range(self.t1):
-            self.video.dscales[i] = self.video.disps[i].median() / self.video.disps_prior[i].median()
+            self._initialize_dscale(i)
         for itr in range(8):
             self.graph.update(1, use_inactive=True, use_mono=itr>2)
 

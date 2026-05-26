@@ -17,6 +17,34 @@ Tracking:
     frontend_radius: 2    # force edges between frames within radius")
     frontend_nms: 1       # non-maximal supression of edges")
     mono_depth_alpha: 0.01
+    use_scal3r_prior: false
+    scal3r_prior:
+      active: false
+      mode: replace_omnidata_depth
+      cache_json: ""
+      aligned_depth_dir: ""
+      confidence_dir: ""
+      dba_depth_dir: ""
+      render_depth_dir: ""
+      rgb_dir: ""
+      depth_source: aligned_depth_dir
+      confidence_default: 1.0
+      confidence_power: 1.0
+      min_confidence: 0.0
+      min_confident_pixels: 128
+      initialize_dscale: median_ratio
+      confidence_weights:
+        depth: 1.0
+        render: 1.0
+        texture: 0.5
+      confidence_rel_sigma: 0.1
+      render_confidence_rel_sigma: 0.1
+      texture_min_grad: 0.02
+      texture_max_grad: 0.2
+      resize_depth_interpolation: bilinear
+      resize_confidence_interpolation: nearest
+      missing_policy: fallback_omnidata
+      base_dir: ""
   backend:
     backend_thresh: 40.0  # add loop closure edges within this distance (larger is more edges)')
     backend_radius: 2     # connect neighbors within radius (larger is more edges)')

@@ -169,7 +169,21 @@ def get_prior_depth_aligned(depth_prior, scales):
     return depth_prior_aligned, Jbi
 
 
-def JDSA(target, weight, eta, poses, disps, intrinsics, disps_prior, dscales, ii, jj, alpha):
+def prepare_jdsa_prior_terms(disps_prior, prior_conf, kx, ht, wd, alpha):
+    disps_prior = disps_prior[kx]
+    valid_prior = (disps_prior > 0).to(torch.float).view(-1, ht*wd)
+    if prior_conf is None:
+        prior_weight = torch.ones_like(valid_prior)
+    else:
+        prior_weight = prior_conf[kx].to(disps_prior.device).float().clamp(0, 1).view(-1, ht*wd)
+    prior_alpha = valid_prior * prior_weight * float(alpha)
+    return disps_prior, valid_prior, prior_weight, prior_alpha
+
+
+def JDSA(
+    target, weight, eta, poses, disps, intrinsics, disps_prior, dscales, ii, jj, alpha, 
+    prior_conf=None, log_prior=False
+):
 
     B, P, ht, wd = disps.shape
     N = ii.shape[0]
@@ -180,8 +194,9 @@ def JDSA(target, weight, eta, poses, disps, intrinsics, disps_prior, dscales, ii
     kx, kk = torch.unique(ii, return_inverse=True)
     M = kx.shape[0]
 
-    disps_prior = disps_prior[kx]
-    m = (disps_prior > 0).to(torch.float).view(-1, ht*wd)
+    disps_prior, valid_prior, prior_weight, prior_alpha = prepare_jdsa_prior_terms(
+        disps_prior, prior_conf, kx, ht, wd, alpha
+    )
 
     hs, ws = dscales.shape[-2:]
     disps_bi, Jbi = get_prior_depth_aligned(disps_prior, dscales[kx])
@@ -189,22 +204,22 @@ def JDSA(target, weight, eta, poses, disps, intrinsics, disps_prior, dscales, ii
     rd = (disps[0,kx] - disps_bi).view(-1, ht*wd)
     Jd = torch.ones_like(rd).view(1, -1, 1, ht*wd)
     # Jd = (-1. / (disps[0,kx] ** 2)).view(1, -1, 1, ht*wd)
-    Jso = -m.unsqueeze(-1) * disps_prior.view(-1, ht*wd).unsqueeze(-1) * Jbi.view(M, ht*wd, -1)[None]
-
-    alpha = torch.ones(M,ht*wd,1).float().cuda() * alpha
+    Jso = -valid_prior.unsqueeze(-1) * disps_prior.view(-1, ht*wd).unsqueeze(-1) * Jbi.view(M, ht*wd, -1)[None]
 
     D = hs*ws
     fixedp = kx[0]
     kx = kx - fixedp
-    wJsoT = (alpha * Jso).transpose(2,3)
+    wJsoT = (prior_alpha.unsqueeze(-1) * Jso).transpose(2,3)
     Hs = safe_scatter_add_mat(wJsoT @ Jso, kx, kx, M, M).view(B, M, M, D, D)
     Es = safe_scatter_add_mat(wJsoT * Jd, kx, kx, M, M).view(B, M, M, D, ht*wd)
     vs = safe_scatter_add_vec(-wJsoT @ rd[None].unsqueeze(-1), kx, M)
     kx += fixedp
 
-    alpha = alpha.squeeze()
-    C = C[None] + m * alpha * (Jd * Jd).squeeze() + (1-m) * eta.view(*C.shape)
-    w = w[None] - m * alpha * rd * Jd.squeeze()
+    C = C[None] + prior_alpha * (Jd * Jd).squeeze() + (1-valid_prior) * eta.view(*C.shape)
+    w = w[None] - prior_alpha * rd * Jd.squeeze()
+
+    if log_prior:
+        _log_jdsa_prior_stats(rd, valid_prior, prior_weight)
 
     ### 3: solve the system ###
     dso, dz, dzcov = schur_solve_mono_prior(C, w, Hs, Es, vs, dzcov=True)
@@ -217,3 +232,19 @@ def JDSA(target, weight, eta, poses, disps, intrinsics, disps_prior, dscales, ii
     disps = disps.clamp(min=0.001)
 
     return disps, dscales, dzcov
+
+
+def _log_jdsa_prior_stats(rd, valid_prior, prior_weight):
+    valid = valid_prior > 0
+    if not torch.any(valid):
+        print("[JDSA Scal3R prior] no valid prior pixels")
+        return
+    residual = rd.detach().abs()[valid]
+    confidence = prior_weight.detach()[valid].float()
+    hist = torch.histc(confidence, bins=5, min=0.0, max=1.0).to(torch.int64).cpu().tolist()
+    print(
+        "[JDSA Scal3R prior] "
+        f"residual_abs_mean={residual.mean().item():.6f} "
+        f"residual_abs_median={residual.median().item():.6f} "
+        f"confidence_histogram_5bins={hist}"
+    )

@@ -10,6 +10,13 @@ import geom.projective_ops as pops
 from geom.ba import JDSA
 from pgo_buffer import global_relative_posesim3_constraints
 
+
+def inverse_positive_depth(depth):
+    inverse = torch.zeros_like(depth, dtype=torch.float)
+    valid = torch.isfinite(depth) & (depth > 0)
+    inverse[valid] = 1.0 / depth[valid].float()
+    return inverse
+
 class DepthVideo:
     def __init__(self, config, image_size, buffer):
 
@@ -31,8 +38,11 @@ class DepthVideo:
         self.disps_up = torch.zeros(buffer, ht, wd, device="cpu", dtype=torch.float).share_memory_()
         self.disps_prior = torch.zeros(buffer, ht//8, wd//8, device="cuda", dtype=torch.float).share_memory_()
         self.disps_prior_up = torch.zeros(buffer, ht, wd, device="cpu", dtype=torch.float).share_memory_()
+        self.disps_prior_conf = torch.ones(buffer, ht//8, wd//8, device="cuda", dtype=torch.float).share_memory_()
+        self.disps_prior_conf_up = torch.ones(buffer, ht, wd, device="cpu", dtype=torch.float).share_memory_()
         self.intrinsics = torch.zeros(buffer, 4, device="cuda", dtype=torch.float).share_memory_()
         self.normals = torch.zeros(buffer, 3, ht, wd, device="cpu", dtype=torch.float)
+        self.use_scal3r_prior = False
 
         ### feature attributes ###
         self.fmaps = torch.zeros(buffer, 1, 128, ht//8, wd//8, dtype=torch.half, device="cuda").share_memory_()
@@ -68,9 +78,17 @@ class DepthVideo:
             self.disps[index] = item[3]
 
         if item[4] is not None:
-            self.disps_prior_up[index] = 1.0/item[4]
+            depth_prior = item[4].float()
+            self.disps_prior_up[index] = inverse_positive_depth(depth_prior).cpu()
             depth = item[4][3::8,3::8]
-            self.disps_prior[index] = torch.where(depth>0, 1.0/depth, 0).cuda()
+            self.disps_prior[index] = inverse_positive_depth(depth).cuda()
+            self.disps_prior_conf_up[index].fill_(1.0)
+            self.disps_prior_conf[index].fill_(1.0)
+
+        if len(item) > 10 and item[10] is not None:
+            conf = item[10].float().clamp(0, 1)
+            self.disps_prior_conf_up[index] = conf.cpu()
+            self.disps_prior_conf[index] = conf[3::8,3::8].cuda()
 
         if item[5] is not None:
             self.normals[index] = item[5]
@@ -126,6 +144,8 @@ class DepthVideo:
             self.disps_prior[ix+n:self.counter.value+n] = self.disps_prior[ix:self.counter.value].clone()
             self.disps_up[ix+n:self.counter.value+n] = self.disps_up[ix:self.counter.value].clone()
             self.disps_prior_up[ix+n:self.counter.value+n] = self.disps_prior_up[ix:self.counter.value].clone()
+            self.disps_prior_conf[ix+n:self.counter.value+n] = self.disps_prior_conf[ix:self.counter.value].clone()
+            self.disps_prior_conf_up[ix+n:self.counter.value+n] = self.disps_prior_conf_up[ix:self.counter.value].clone()
             self.intrinsics[ix+n:self.counter.value+n] = self.intrinsics[ix:self.counter.value].clone()
             self.normals[ix+n:self.counter.value+n] = self.normals[ix:self.counter.value].clone()
             self.fmaps[ix+n:self.counter.value+n] = self.fmaps[ix:self.counter.value].clone()
@@ -235,7 +255,22 @@ class DepthVideo:
                 poses = lietorch.SE3(self.poses[:t1][None])
                 disps = self.disps[:t1][None]
                 dscales = self.dscales[:t1]
-                disps, dscales, _ = JDSA(target, weight, eta, poses, disps, self.intrinsics[None], self.disps_prior, dscales, ii, jj, self.mono_depth_alpha)
+                prior_conf = self.disps_prior_conf if self.use_scal3r_prior else None
+                disps, dscales, _ = JDSA(
+                    target,
+                    weight,
+                    eta,
+                    poses,
+                    disps,
+                    self.intrinsics[None],
+                    self.disps_prior,
+                    dscales,
+                    ii,
+                    jj,
+                    self.mono_depth_alpha,
+                    prior_conf=prior_conf,
+                    log_prior=self.use_scal3r_prior,
+                )
                 self.disps[:t1] = disps[0]
                 self.dscales[:t1] = dscales
 

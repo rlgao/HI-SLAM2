@@ -20,7 +20,7 @@ def sharpness(image):
 class MotionFilter:
     """ This class is used to filter incoming frames and extract features """
 
-    def __init__(self, net, video, config, device="cuda:0"):
+    def __init__(self, net, video, config, device="cuda:0", prior_provider=None):
         
         # split net modules
         self.cnet = net.cnet
@@ -31,6 +31,7 @@ class MotionFilter:
         self.thresh = config["thresh"]
         self.init_thresh = config["init_thresh"] if "init_thresh" in config else self.thresh
         self.device = device
+        self.prior_provider = prior_provider
 
         self.count = 0
         self.omni_dep = None
@@ -80,6 +81,24 @@ class MotionFilter:
         normal = normal.float().squeeze()
         return depth, normal
 
+    def apply_external_prior(self, tstamp, depth):
+        if self.prior_provider is None:
+            return depth, None
+        external = self.prior_provider.get_prior(int(tstamp), tuple(depth.shape[-2:]))
+        if external is None:
+            return depth, None
+        external_depth = torch.as_tensor(external.depth, device=depth.device, dtype=depth.dtype)
+        prior_conf = torch.as_tensor(external.confidence, device=depth.device, dtype=depth.dtype)
+        finite_conf = prior_conf[torch.isfinite(prior_conf)]
+        conf_mean = finite_conf.mean().item() if finite_conf.numel() else 0.0
+        print(
+            "[Scal3R prior] "
+            f"frame={int(tstamp)} "
+            f"depth_path={external.depth_path} "
+            f"confidence_mean={conf_mean:.6f}"
+        )
+        return external_depth, prior_conf
+
     @torch.cuda.amp.autocast(enabled=True)
     @torch.no_grad()
     def track(self, tstamp, image, intrinsics=None, is_last=False):
@@ -102,9 +121,10 @@ class MotionFilter:
         ### always add first frame to the depth video ###
         if self.video.counter.value == 0:
             depth, normal = self.prior_extractor(inputs[0])
+            depth, prior_conf = self.apply_external_prior(tstamp, depth)
             net, inp = self.context_encoder(inputs[:,[0]])
             self.net, self.inp, self.fmap = net, inp, gmap
-            self.video.append(tstamp, image[0], None, 1.0, depth, normal, intrinsics, gmap, net[0], inp[0])
+            self.video.append(tstamp, image[0], None, 1.0, depth, normal, intrinsics, gmap, net[0], inp[0], prior_conf)
 
         ### only add new frame if there is enough motion ###
         else:                
@@ -126,10 +146,11 @@ class MotionFilter:
                 self.cache = [None]*5
 
                 depth, normal = self.prior_extractor(inputs[0])
+                depth, prior_conf = self.apply_external_prior(tstamp, depth)
                 self.count = 0
                 net, inp = self.context_encoder(inputs[:,[0]])
                 self.net, self.inp, self.fmap = net, inp, gmap
-                self.video.append(tstamp, image[0], None, None, depth, normal, intrinsics, gmap, net[0], inp[0])
+                self.video.append(tstamp, image[0], None, None, depth, normal, intrinsics, gmap, net[0], inp[0], prior_conf)
 
             else:
                 self.shapeness[tstamp%5] = s

@@ -163,6 +163,8 @@ class FactorGraph:
             self.video.disps_up[ix] = self.video.disps_up[ix+1]
             self.video.disps_prior[ix] = self.video.disps_prior[ix+1]
             self.video.disps_prior_up[ix] = self.video.disps_prior_up[ix+1]
+            self.video.disps_prior_conf[ix] = self.video.disps_prior_conf[ix+1]
+            self.video.disps_prior_conf_up[ix] = self.video.disps_prior_conf_up[ix+1]
             self.video.intrinsics[ix] = self.video.intrinsics[ix+1]
             self.video.normals[ix] = self.video.normals[ix+1]
             self.video.nets[ix] = self.video.nets[ix+1]

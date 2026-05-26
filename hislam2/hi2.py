@@ -27,12 +27,20 @@ class Hi2:
 
         # store images, depth, poses, intrinsics (shared between processes)
         self.video = DepthVideo(config, args.image_size, args.buffer)
+        frontend_config = config["Tracking"]["frontend"]
+        self.scal3r_prior_provider = self._build_scal3r_prior_provider(frontend_config)
+        self.video.use_scal3r_prior = self.scal3r_prior_provider is not None
 
         # filter incoming frames so that there is enough motion
-        self.filterx = MotionFilter(self.net, self.video, config["Tracking"]["motion_filter"])
+        self.filterx = MotionFilter(
+            self.net,
+            self.video,
+            config["Tracking"]["motion_filter"],
+            prior_provider=self.scal3r_prior_provider,
+        )
 
         # frontend process
-        self.frontend = TrackFrontend(self.net, self.video, config["Tracking"]["frontend"])
+        self.frontend = TrackFrontend(self.net, self.video, frontend_config)
 
         # backend process
         self.backend = TrackBackend(self.net, self.video, config["Tracking"]["backend"])
@@ -70,6 +78,17 @@ class Hi2:
         state_dict["update.delta.2.bias"] = state_dict["update.delta.2.bias"][:2]
         self.net.load_state_dict(state_dict)
         self.net.to("cuda:0").eval()
+
+    def _build_scal3r_prior_provider(self, frontend_config):
+        scal3r_config = frontend_config.get("scal3r_prior", {})
+        use_scal3r_prior = bool(frontend_config.get("use_scal3r_prior", scal3r_config.get("active", False)))
+        if not use_scal3r_prior:
+            return None
+        from ffgs_slam.prior.hislam2_provider import Scal3RDepthPriorProvider
+
+        provider = Scal3RDepthPriorProvider.from_config(scal3r_config)
+        print("[Scal3R prior] enabled")
+        return provider
 
     def call_gs(self, viz_idx, dposes=None, dscale=None):
         data = {
@@ -157,6 +176,7 @@ class Hi2:
                 place = (self.video.tstamp > ind).nonzero()[0].item()
                 self.video.shift(place)
                 depth, normal = self.filterx.prior_extractor(inputs[i])
+                depth, prior_conf = self.filterx.apply_external_prior(ind, depth)
                 self.video[place] = (
                     ind, 
                     images[i], 
@@ -167,7 +187,8 @@ class Hi2:
                     None, 
                     gmap[i], 
                     net[i,0], 
-                    inp[i,0]
+                    inp[i,0],
+                    prior_conf.cpu() if prior_conf is not None else None
                 )
         del self.filterx
 
