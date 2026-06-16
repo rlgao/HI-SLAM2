@@ -36,6 +36,14 @@ class GSBackEnd(mp.Process):
         self.gaussians.init_lr(6.0)
         self.gaussians.training_setup(self.opt_params)
         self.background = torch.tensor([0, 0, 0], dtype=torch.float32, device="cuda")
+        self.scal3r_gaussian_init_mode = "off"
+        self.scal3r_gaussian_init_provider = self._build_scal3r_gaussian_init_provider()
+        self.scal3r_gaussian_init_min_pixels = int(
+            self.config.get("Training", {})
+            .get("scal3r_gaussian_init", {})
+            .get("min_confident_pixels", 128)
+        )
+        self.gaussian_init_source_counts = {}
 
         self.cameras_extent = 6.0
         self.set_hyperparams()
@@ -164,9 +172,156 @@ class GSBackEnd(mp.Process):
         )
 
     def add_next_kf(self, frame_idx, viewpoint, init=False, scale=2.0, depth_map=None):
+        if self.scal3r_gaussian_init_mode == "pointmap" and self.scal3r_gaussian_init_provider is not None:
+            before_count = int(self.gaussians.get_xyz.shape[0])
+            added = self._add_pointmap_gaussians(frame_idx, viewpoint, depth_map, before_count)
+            if added:
+                return
+
+        depth_map = self._select_gaussian_init_depth(frame_idx, viewpoint, depth_map)
+        before_count = int(self.gaussians.get_xyz.shape[0])
         self.gaussians.extend_from_pcd_seq(
             viewpoint, kf_id=frame_idx, init=init, scale=scale, depthmap=depth_map
         )
+        after_count = int(self.gaussians.get_xyz.shape[0])
+        if self.scal3r_gaussian_init_provider is not None:
+            Log(
+                f"frame={self._frame_id_for_prior(frame_idx, viewpoint)} "
+                f"gaussians_before={before_count} gaussians_after={after_count}",
+                tag="Scal3R-GS",
+            )
+
+    def _build_scal3r_gaussian_init_provider(self):
+        gaussian_config = self.config.get("Training", {}).get("scal3r_gaussian_init", {})
+        if not bool(gaussian_config.get("active", False)):
+            return None
+
+        mode = str(gaussian_config.get("mode", "aligned_depth")).lower()
+        if mode == "off":
+            return None
+        if mode not in {"aligned_depth", "pointmap"}:
+            raise ValueError("Training.scal3r_gaussian_init.mode must be 'off', 'aligned_depth', or 'pointmap'")
+        self.scal3r_gaussian_init_mode = mode
+
+        if mode == "aligned_depth":
+            from ffgs_slam.prior.hislam2_provider import Scal3RDepthPriorProvider
+
+            provider = Scal3RDepthPriorProvider.from_config(gaussian_config)
+        else:
+            from ffgs_slam.mapping.scal3r_gaussian_init import Scal3RPointmapGaussianInitProvider
+
+            provider = Scal3RPointmapGaussianInitProvider.from_config(gaussian_config)
+        Log(f"Scal3R Gaussian initialization enabled mode={mode}", tag="Scal3R-GS")
+        return provider
+
+    def _select_gaussian_init_depth(self, frame_idx, viewpoint, depth_map):
+        if depth_map is None:
+            return depth_map
+        if self.scal3r_gaussian_init_provider is None:
+            return depth_map
+        if self.scal3r_gaussian_init_mode != "aligned_depth":
+            return depth_map
+
+        from ffgs_slam.mapping.scal3r_gaussian_init import select_gaussian_init_depth
+
+        frame_id = self._frame_id_for_prior(frame_idx, viewpoint)
+        selection = select_gaussian_init_depth(
+            frame_id=frame_id,
+            dba_depth=depth_map,
+            provider=self.scal3r_gaussian_init_provider,
+            min_confident_pixels=self.scal3r_gaussian_init_min_pixels,
+        )
+        self.gaussian_init_source_counts[selection.source] = (
+            self.gaussian_init_source_counts.get(selection.source, 0) + 1
+        )
+        conf_mean = "none" if selection.confidence_mean is None else f"{selection.confidence_mean:.4f}"
+        conf_median = "none" if selection.confidence_median is None else f"{selection.confidence_median:.4f}"
+        Log(
+            f"frame={frame_id} source={selection.source} "
+            f"valid_pixels={selection.valid_pixels} "
+            f"confidence_mean={conf_mean} confidence_median={conf_median} "
+            f"source_counts={self.gaussian_init_source_counts}",
+            tag="Scal3R-GS",
+        )
+        return selection.depth
+
+    def _add_pointmap_gaussians(self, frame_idx, viewpoint, depth_map, before_count):
+        from gaussian.utils.general_utils import inverse_sigmoid
+        from gaussian.utils.sh_utils import RGB2SH
+        from simple_knn._C import distCUDA2
+
+        frame_id = self._frame_id_for_prior(frame_idx, viewpoint)
+        selection = self.scal3r_gaussian_init_provider.select_candidates(
+            frame_id=frame_id,
+            camera=viewpoint,
+            dba_depth=depth_map,
+        )
+        self.gaussian_init_source_counts[selection.source] = (
+            self.gaussian_init_source_counts.get(selection.source, 0) + 1
+        )
+        if selection.source != "scal3r_pointmap":
+            Log(
+                f"frame={frame_id} source={selection.source} "
+                f"fallback_reason={selection.fallback_reason} "
+                f"valid_points={selection.valid_points} "
+                f"projected_points={selection.projected_points} "
+                f"depth_consistent_points={selection.depth_consistent_points} "
+                f"source_counts={self.gaussian_init_source_counts}",
+                tag="Scal3R-GS",
+            )
+            return False
+
+        fused_point_cloud = torch.from_numpy(selection.points).float().cuda()
+        fused_color = RGB2SH(torch.from_numpy(selection.colors).float().cuda())
+        features = (
+            torch.zeros((fused_color.shape[0], 3, (self.gaussians.max_sh_degree + 1) ** 2))
+            .float()
+            .cuda()
+        )
+        features[:, :3, 0] = fused_color
+        features[:, 3:, 1:] = 0.0
+
+        point_size = self.config["Dataset"]["point_size"]
+        dist2 = torch.clamp_min(distCUDA2(fused_point_cloud), 0.0000001) * point_size
+        scales = torch.log(torch.sqrt(dist2))[..., None]
+        if not self.gaussians.isotropic:
+            scales = scales.repeat(1, 3)
+
+        rots = torch.zeros((fused_point_cloud.shape[0], 4), device="cuda")
+        rots[:, 0] = 1
+        opacities = inverse_sigmoid(
+            0.5
+            * torch.ones(
+                (fused_point_cloud.shape[0], 1), dtype=torch.float, device="cuda"
+            )
+        )
+        self.gaussians.extend_from_pcd(
+            fused_point_cloud,
+            features,
+            scales,
+            rots,
+            opacities,
+            frame_idx,
+        )
+        after_count = int(self.gaussians.get_xyz.shape[0])
+        Log(
+            f"frame={frame_id} source=scal3r_pointmap "
+            f"valid_points={selection.valid_points} "
+            f"projected_points={selection.projected_points} "
+            f"depth_consistent_points={selection.depth_consistent_points} "
+            f"gaussians_before={before_count} gaussians_after={after_count} "
+            f"pointmap_path={selection.pointmap_path} "
+            f"source_counts={self.gaussian_init_source_counts}",
+            tag="Scal3R-GS",
+        )
+        return True
+
+    @staticmethod
+    def _frame_id_for_prior(frame_idx, viewpoint):
+        tstamp = getattr(viewpoint, "tstamp", None)
+        if tstamp is None:
+            return int(frame_idx)
+        return int(tstamp)
 
     def reset(self):
         self.iteration_count = 0
