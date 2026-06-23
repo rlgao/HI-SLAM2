@@ -260,12 +260,20 @@ class GSBackEnd(mp.Process):
             self.gaussian_init_source_counts.get(selection.source, 0) + 1
         )
         if selection.source != "scal3r_pointmap":
+            conf_mean = "none" if selection.confidence_mean is None else f"{selection.confidence_mean:.4f}"
+            conf_median = "none" if selection.confidence_median is None else f"{selection.confidence_median:.4f}"
+            conf_min = "none" if selection.confidence_min is None else f"{selection.confidence_min:.4f}"
+            conf_max = "none" if selection.confidence_max is None else f"{selection.confidence_max:.4f}"
             Log(
                 f"frame={frame_id} source={selection.source} "
                 f"fallback_reason={selection.fallback_reason} "
                 f"valid_points={selection.valid_points} "
                 f"projected_points={selection.projected_points} "
                 f"depth_consistent_points={selection.depth_consistent_points} "
+                f"confidence_filtered_points={selection.confidence_filtered_points} "
+                f"confidence_mean={conf_mean} confidence_median={conf_median} "
+                f"confidence_min={conf_min} confidence_max={conf_max} "
+                f"confidence_path={selection.confidence_path} "
                 f"source_counts={self.gaussian_init_source_counts}",
                 tag="Scal3R-GS",
             )
@@ -304,13 +312,21 @@ class GSBackEnd(mp.Process):
             frame_idx,
         )
         after_count = int(self.gaussians.get_xyz.shape[0])
+        conf_mean = "none" if selection.confidence_mean is None else f"{selection.confidence_mean:.4f}"
+        conf_median = "none" if selection.confidence_median is None else f"{selection.confidence_median:.4f}"
+        conf_min = "none" if selection.confidence_min is None else f"{selection.confidence_min:.4f}"
+        conf_max = "none" if selection.confidence_max is None else f"{selection.confidence_max:.4f}"
         Log(
             f"frame={frame_id} source=scal3r_pointmap "
             f"valid_points={selection.valid_points} "
             f"projected_points={selection.projected_points} "
             f"depth_consistent_points={selection.depth_consistent_points} "
+            f"confidence_filtered_points={selection.confidence_filtered_points} "
+            f"confidence_mean={conf_mean} confidence_median={conf_median} "
+            f"confidence_min={conf_min} confidence_max={conf_max} "
             f"gaussians_before={before_count} gaussians_after={after_count} "
             f"pointmap_path={selection.pointmap_path} "
+            f"confidence_path={selection.confidence_path} "
             f"source_counts={self.gaussian_init_source_counts}",
             tag="Scal3R-GS",
         )

@@ -75,12 +75,25 @@ Training:
     cache_json: ""
     aligned_depth_dir: ""
     confidence_dir: ""
+    dba_depth_dir: ""
+    render_depth_dir: ""
+    rgb_dir: ""
     pointmap_path: ""
     chunk_id: ""
     depth_source: aligned_depth_dir
     confidence_default: 1.0
     confidence_power: 1.0
     min_confidence: 0.0
+    confidence_fusion: false
+    confidence_sampling_power: 2.0
+    confidence_weights:
+      depth: 1.0
+      render: 1.0
+      texture: 0.5
+    confidence_rel_sigma: 0.1
+    render_confidence_rel_sigma: 0.1
+    texture_min_grad: 0.02
+    texture_max_grad: 0.2
     min_confident_pixels: 128
     pointmap_frame: scal3r
     pointmap_max_points: 20000
