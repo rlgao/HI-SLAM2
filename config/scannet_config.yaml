@@ -45,6 +45,37 @@ Tracking:
       resize_confidence_interpolation: nearest
       missing_policy: fallback_omnidata
       base_dir: ""
+    online_scal3r:
+      active: false
+      mode: keyframe_chunks
+      chunk_size: 20
+      overlap: 5
+      max_pending_chunks: 2
+      min_keyframes_for_first_chunk: 8
+      submit_on_publish: true
+      consume_frontend_prior: false
+      alignment_max_rmse: 0.25
+      stale_after_keyframes: 40
+      max_ready_chunks: 4
+      worker:
+        type: process
+        runtime_root: ""
+        checkpoint: ckpts/scal3r/scal3r.pt
+        gpu_id: "0"
+        scal3r_root: third_party/Scal3R
+        python: python
+        timeout_sec: 300
+        dry_run: false
+        fake_ready: false
+        image_suffix: .png
+      alignment_confidence:
+        min_match_ratio: 0.5
+        write_debug_artifacts: true
+      runtime_policy:
+        max_ready_chunks: 4
+        stale_after_keyframes: 40
+        spill_ready_arrays_to_disk: false
+        debug_log_path: ""
   backend:
     backend_thresh: 40.0  # add loop closure edges within this distance (larger is more edges)')
     backend_radius: 2     # connect neighbors within radius (larger is more edges)')
@@ -73,6 +104,7 @@ Training:
   scal3r_gaussian_init:
     active: false
     mode: off
+    online_registry: false
     cache_json: ""
     aligned_depth_dir: ""
     confidence_dir: ""

@@ -18,9 +18,10 @@ from gaussian.utils.eval_utils import eval_rendering, eval_rendering_kf
 from gaussian.gui import gui_utils, slam_gui
 
 class GSBackEnd(mp.Process):
-    def __init__(self, config, save_dir, use_gui=False):
+    def __init__(self, config, save_dir, use_gui=False, online_scal3r_manager=None):
         super().__init__()
         self.config = config
+        self.online_scal3r_manager = online_scal3r_manager
         
         self.iteration_count = 0
         self.viewpoints = {}
@@ -44,6 +45,7 @@ class GSBackEnd(mp.Process):
             .get("min_confident_pixels", 128)
         )
         self.gaussian_init_source_counts = {}
+        self._online_pointmap_backfill_attempted = set()
 
         self.cameras_extent = 6.0
         self.set_hyperparams()
@@ -131,6 +133,7 @@ class GSBackEnd(mp.Process):
                 else:
                     self.viewpoints[idx] = viewpoint
 
+        self.consume_ready_online_pointmap_priors()
         self.map(self.current_window, iters=10)
         # self.map(self.current_window, iters=1, prune=True)
 
@@ -204,10 +207,32 @@ class GSBackEnd(mp.Process):
         self.scal3r_gaussian_init_mode = mode
 
         if mode == "aligned_depth":
+            if bool(gaussian_config.get("online_registry", False)):
+                if self.online_scal3r_manager is None:
+                    Log(
+                        "online_registry requested but online Scal3R manager is disabled; using DBA fallback",
+                        tag="Scal3R-GS",
+                    )
+                    return None
+                provider = self.online_scal3r_manager.depth_prior_provider(consumer="gaussian")
+                Log("Scal3R Gaussian initialization enabled mode=aligned_depth source=online_registry", tag="Scal3R-GS")
+                return provider
+
             from ffgs_slam.prior.hislam2_provider import Scal3RDepthPriorProvider
 
             provider = Scal3RDepthPriorProvider.from_config(gaussian_config)
         else:
+            if bool(gaussian_config.get("online_registry", False)):
+                if self.online_scal3r_manager is None:
+                    Log(
+                        "online_registry requested but online Scal3R manager is disabled; using DBA fallback",
+                        tag="Scal3R-GS",
+                    )
+                    return None
+                provider = self.online_scal3r_manager.gaussian_pointmap_provider(gaussian_config)
+                Log("Scal3R Gaussian initialization enabled mode=pointmap source=online_registry", tag="Scal3R-GS")
+                return provider
+
             from ffgs_slam.mapping.scal3r_gaussian_init import Scal3RPointmapGaussianInitProvider
 
             provider = Scal3RPointmapGaussianInitProvider.from_config(gaussian_config)
@@ -331,6 +356,67 @@ class GSBackEnd(mp.Process):
             tag="Scal3R-GS",
         )
         return True
+
+    def consume_ready_online_pointmap_priors(self):
+        if not self._online_pointmap_backfill_enabled():
+            return []
+
+        frame_ids = self.online_scal3r_manager.ready_prior_frame_ids(
+            frame_ids=self.viewpoints.keys(),
+            exclude_frame_ids=self._online_pointmap_backfill_attempted,
+        )
+        consumed = []
+        for frame_id in frame_ids:
+            viewpoint = self.viewpoints.get(frame_id)
+            if viewpoint is None:
+                continue
+
+            self._online_pointmap_backfill_attempted.add(frame_id)
+            before_count = int(self.gaussians.get_xyz.shape[0])
+            depth_map = self._viewpoint_depth_numpy(viewpoint)
+            try:
+                added = self._add_pointmap_gaussians(frame_id, viewpoint, depth_map, before_count)
+            except Exception as exc:
+                Log(
+                    f"frame={frame_id} late_backfill_skipped={exc}",
+                    tag="Scal3R-GS",
+                )
+                continue
+            if added:
+                consumed.append(frame_id)
+
+        if consumed:
+            Log(
+                f"late_backfill_consumed={consumed}",
+                tag="Scal3R-GS",
+            )
+        return consumed
+
+    def _online_pointmap_backfill_enabled(self):
+        gaussian_config = self.config.get("Training", {}).get("scal3r_gaussian_init", {})
+        return (
+            self.online_scal3r_manager is not None
+            and self.scal3r_gaussian_init_mode == "pointmap"
+            and self.scal3r_gaussian_init_provider is not None
+            and bool(gaussian_config.get("online_registry", False))
+        )
+
+    @staticmethod
+    def _viewpoint_depth_numpy(viewpoint):
+        depth = getattr(viewpoint, "depth", None)
+        if depth is None:
+            return None
+        converted = depth
+        detach = getattr(converted, "detach", None)
+        if callable(detach):
+            converted = detach()
+        cpu = getattr(converted, "cpu", None)
+        if callable(cpu):
+            converted = cpu()
+        numpy = getattr(converted, "numpy", None)
+        if callable(numpy):
+            converted = numpy()
+        return np.asarray(converted, dtype=np.float32)
 
     @staticmethod
     def _frame_id_for_prior(frame_idx, viewpoint):

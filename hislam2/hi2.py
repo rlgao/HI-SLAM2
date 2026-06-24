@@ -17,6 +17,9 @@ from gs_backend import GSBackEnd
 from pgo_buffer import PGOBuffer
 
 
+_USE_PUBLISHED_FRAME_ID = object()
+
+
 class Hi2:
     def __init__(self, args):
         super(Hi2, self).__init__()
@@ -28,6 +31,7 @@ class Hi2:
         # store images, depth, poses, intrinsics (shared between processes)
         self.video = DepthVideo(config, args.image_size, args.buffer)
         frontend_config = config["Tracking"]["frontend"]
+        self.online_scal3r_manager = self._build_online_scal3r_manager(config, args.output)
         self.scal3r_prior_provider = self._build_scal3r_prior_provider(frontend_config)
         self.video.use_scal3r_prior = self.scal3r_prior_provider is not None
 
@@ -46,7 +50,12 @@ class Hi2:
         self.backend = TrackBackend(self.net, self.video, config["Tracking"]["backend"])
 
         # 3dgs
-        self.gs = GSBackEnd(config, self.args.output, args.gsvis)
+        self.gs = GSBackEnd(
+            config,
+            self.args.output,
+            args.gsvis,
+            online_scal3r_manager=self.online_scal3r_manager,
+        )
 
         # post processor - fill in poses for non-keyframes
         self.traj_filler = PoseTrajectoryFiller(self.net, self.video)
@@ -80,6 +89,13 @@ class Hi2:
         self.net.to("cuda:0").eval()
 
     def _build_scal3r_prior_provider(self, frontend_config):
+        if (
+            self.online_scal3r_manager is not None
+            and self.online_scal3r_manager.config.consume_frontend_prior
+        ):
+            print("[Online Scal3R] frontend depth-prior consumer enabled")
+            return self.online_scal3r_manager.depth_prior_provider(consumer="frontend")
+
         scal3r_config = frontend_config.get("scal3r_prior", {})
         use_scal3r_prior = bool(frontend_config.get("use_scal3r_prior", scal3r_config.get("active", False)))
         if not use_scal3r_prior:
@@ -89,6 +105,11 @@ class Hi2:
         provider = Scal3RDepthPriorProvider.from_config(scal3r_config)
         print("[Scal3R prior] enabled")
         return provider
+
+    def _build_online_scal3r_manager(self, config, output_path):
+        from ffgs_slam.online import OnlineScal3RManager
+
+        return OnlineScal3RManager.from_config(config, output_path=output_path)
 
     def call_gs(self, viz_idx, dposes=None, dscale=None):
         data = {
@@ -119,6 +140,8 @@ class Hi2:
             # Frontend local BA
             viz_idx = self.frontend(is_last=is_last)
 
+            self._publish_online_scal3r_keyframes(current_frame_id=tstamp)
+
         # Optional PGBA
         if len(viz_idx) and self.pgba:
             dposes, dscale = self.video.pgobuf.run_pgba(self.LC_data_queue)
@@ -132,6 +155,84 @@ class Hi2:
         # If frontend returns updated keyframe indices
         if len(viz_idx):
             self.call_gs(viz_idx)
+
+    def _publish_online_scal3r_keyframes(self, current_frame_id=None, policy_current_frame_id=_USE_PUBLISHED_FRAME_ID):
+        manager = self.online_scal3r_manager
+        if manager is None:
+            return
+
+        try:
+            counter = int(self.video.counter.value)
+            if counter <= 0:
+                poll_frame_id = (
+                    _to_int_or_none(current_frame_id)
+                    if policy_current_frame_id is _USE_PUBLISHED_FRAME_ID
+                    else _to_int_or_none(policy_current_frame_id)
+                )
+                manager.poll(current_frame_id=poll_frame_id)
+                return
+
+            indices = torch.arange(0, counter, device="cuda")
+            poses_w2c = SE3(self.video.poses[indices]).matrix().detach().cpu()
+            tstamps = self.video.tstamp[:counter].detach().cpu()
+            intrinsics = (self.video.intrinsics[:counter].detach().cpu() * 8.0)
+            images = self.video.images[torch.arange(0, counter)].detach().cpu()
+            dba_depths = _online_dba_depths(self.video, counter)
+            poll_frame_id = (
+                _to_int_or_none(current_frame_id)
+                if policy_current_frame_id is _USE_PUBLISHED_FRAME_ID
+                else _to_int_or_none(policy_current_frame_id)
+            )
+
+            for local_index in range(counter):
+                frame_id = int(tstamps[local_index].item())
+                publish_policy_frame_id = (
+                    frame_id
+                    if policy_current_frame_id is _USE_PUBLISHED_FRAME_ID
+                    else poll_frame_id
+                )
+                dba_depth = None if dba_depths is None else dba_depths[local_index]
+                manager.publish_keyframe(
+                    frame_id=frame_id,
+                    keyframe_index=local_index,
+                    image=images[local_index],
+                    intrinsics=intrinsics[local_index],
+                    pose_w2c=poses_w2c[local_index],
+                    dba_depth=dba_depth,
+                    metadata={"source": "hislam2_depth_video"},
+                    policy_current_frame_id=publish_policy_frame_id,
+                )
+            manager.poll(current_frame_id=poll_frame_id)
+        except Exception as exc:
+            print(f"[Online Scal3R] publish/poll skipped: {exc}")
+
+    def _drain_online_scal3r_before_final_refinement(self):
+        manager = self.online_scal3r_manager
+        if manager is None or manager.config.final_drain_timeout_sec <= 0:
+            return
+
+        current_frame_id = _last_online_frame_id(self.video, self.video.counter.value)
+        print(
+            "[Online Scal3R] final drain started "
+            f"(timeout={manager.config.final_drain_timeout_sec:.1f}s)"
+        )
+        try:
+            self._publish_online_scal3r_keyframes(
+                current_frame_id=current_frame_id,
+                policy_current_frame_id=None,
+            )
+            report = manager.drain(current_frame_id=None)
+            print(
+                "[Online Scal3R] final drain finished "
+                f"submitted={len(report['submitted_chunks'])} "
+                f"worker_results={len(report['worker_results'])} "
+                f"alignment_results={len(report['alignment_results'])} "
+                f"timed_out={report['timed_out']} "
+                f"active_chunks={report.get('active_chunk_ids', [])} "
+                f"inflight_chunks={report.get('inflight_chunk_ids', [])}"
+            )
+        except Exception as exc:
+            print(f"[Online Scal3R] final drain skipped: {exc}")
 
     def terminate(self):
         """ terminate the visualization process, return poses [t, q] """
@@ -201,6 +302,7 @@ class Hi2:
         dposes = SE3(poses_pos).inv() * SE3(poses_pre)
         dscale = torch.ones(self.video.counter.value, 1)
         torch.cuda.empty_cache()
+        self._drain_online_scal3r_before_final_refinement()
 
         # final refinement
         self.call_gs(
@@ -219,5 +321,35 @@ class Hi2:
             self.video.tstamp[:self.video.counter.value].to(device='cpu'),
             save_render_depth=self.args.save_render_depth
         )
+        if self.online_scal3r_manager is not None:
+            self.online_scal3r_manager.shutdown()
         
         return traj_full.inv().data.cpu().numpy()
+
+
+def _online_dba_depths(video, counter):
+    try:
+        disps = video.disps_up[:counter].detach().cpu()
+        valid = torch.isfinite(disps) & (disps > 0)
+        return torch.where(valid, 1.0 / disps, torch.zeros_like(disps)).numpy()
+    except Exception:
+        return None
+
+
+def _to_int_or_none(value):
+    if value is None:
+        return None
+    item = getattr(value, "item", None)
+    if callable(item):
+        value = item()
+    return int(value)
+
+
+def _last_online_frame_id(video, counter):
+    try:
+        count = int(counter)
+        if count <= 0:
+            return None
+        return int(video.tstamp[count - 1].item())
+    except Exception:
+        return None
