@@ -47,14 +47,19 @@ Tracking:
     online_scal3r:
       active: false
       mode: keyframe_chunks
-      chunk_size: 4
+      chunk_size: 2
       overlap: 1
-      max_pending_chunks: 1
-      min_keyframes_for_first_chunk: 4
+      max_pending_chunks: null
+      min_keyframes_for_first_chunk: 1
+      max_chunk_attempts: 1
+      min_valid_depth_ratio: 0.0
       submit_on_publish: true
       consume_frontend_prior: false
-      final_drain_timeout_sec: 300
-      final_drain_poll_interval_sec: 0.25
+      block_until_prior_ready: false
+      block_until_prior_timeout_sec: 300
+      block_until_prior_poll_interval_sec: 0.25
+      keyframe_inference_timeout_sec: 900
+      keyframe_inference_poll_interval_sec: 0.25
       alignment_max_rmse: 0.25
       stale_after_keyframes: 40
       max_ready_chunks: 4
@@ -69,8 +74,9 @@ Tracking:
         dry_run: false
         fake_ready: false
         image_suffix: .png
-        runner_chunk_size: 4
+        runner_chunk_size: 2
         runner_overlap: 1
+        clear_cuda_cache: true
         preprocess_workers: 2
         use_loop: false
         pgo_workers: 1

@@ -24,7 +24,9 @@ class Hi2:
     def __init__(self, args):
         super(Hi2, self).__init__()
         self.load_weights(args.weights)
-        self.config = config = load_config(args.config)
+        config = load_config(args.config)
+        _apply_online_scal3r_cli_overrides(config, args)
+        self.config = config
         self.args = args
         self.images = {}
 
@@ -142,6 +144,9 @@ class Hi2:
 
             self._publish_online_scal3r_keyframes(current_frame_id=tstamp)
 
+        if len(viz_idx):
+            self._block_until_online_prior_ready(viz_idx, current_frame_id=tstamp)
+
         # Optional PGBA
         if len(viz_idx) and self.pgba:
             dposes, dscale = self.video.pgobuf.run_pgba(self.LC_data_queue)
@@ -192,7 +197,7 @@ class Hi2:
                     else poll_frame_id
                 )
                 dba_depth = None if dba_depths is None else dba_depths[local_index]
-                manager.publish_keyframe(
+                report = manager.publish_keyframe(
                     frame_id=frame_id,
                     keyframe_index=local_index,
                     image=images[local_index],
@@ -202,37 +207,46 @@ class Hi2:
                     metadata={"source": "hislam2_depth_video"},
                     policy_current_frame_id=publish_policy_frame_id,
                 )
+                scheduled_chunk_ids = report.get("scheduled_chunks", [])
+                if scheduled_chunk_ids and getattr(manager.config, "require_all_keyframe_inference", False):
+                    wait_report = manager.wait_for_scheduled_chunks(
+                        scheduled_chunk_ids,
+                        current_frame_id=publish_policy_frame_id,
+                    )
+                    print(
+                        "[Online Scal3R] live keyframe inference "
+                        f"chunks={scheduled_chunk_ids} "
+                        f"settled={wait_report['settled_chunk_ids']}"
+                    )
             manager.poll(current_frame_id=poll_frame_id)
+        except TimeoutError:
+            raise
         except Exception as exc:
             print(f"[Online Scal3R] publish/poll skipped: {exc}")
 
-    def _drain_online_scal3r_before_final_refinement(self):
+    def _block_until_online_prior_ready(self, viz_idx, current_frame_id=None):
         manager = self.online_scal3r_manager
-        if manager is None or manager.config.final_drain_timeout_sec <= 0:
-            return
+        if manager is None or not manager.config.block_until_prior_ready:
+            return None
 
-        current_frame_id = _last_online_frame_id(self.video, self.video.counter.value)
-        print(
-            "[Online Scal3R] final drain started "
-            f"(timeout={manager.config.final_drain_timeout_sec:.1f}s)"
-        )
+        frame_ids = _frame_ids_for_viz_idx(self.video, viz_idx)
+        if not frame_ids:
+            return None
+
         try:
-            self._publish_online_scal3r_keyframes(
-                current_frame_id=current_frame_id,
-                policy_current_frame_id=None,
+            report = manager.block_until_prior_ready(
+                frame_ids=frame_ids,
+                current_frame_id=_to_int_or_none(current_frame_id),
             )
-            report = manager.drain(current_frame_id=None)
             print(
-                "[Online Scal3R] final drain finished "
-                f"submitted={len(report['submitted_chunks'])} "
-                f"worker_results={len(report['worker_results'])} "
-                f"alignment_results={len(report['alignment_results'])} "
-                f"timed_out={report['timed_out']} "
-                f"active_chunks={report.get('active_chunk_ids', [])} "
-                f"inflight_chunks={report.get('inflight_chunk_ids', [])}"
+                "[Online Scal3R] blocking wait "
+                f"targets={frame_ids} ready={report['ready_frame_ids']} "
+                f"timed_out={report['timed_out']}"
             )
+            return report
         except Exception as exc:
-            print(f"[Online Scal3R] final drain skipped: {exc}")
+            print(f"[Online Scal3R] blocking wait skipped: {exc}")
+            return None
 
     def terminate(self):
         """ terminate the visualization process, return poses [t, q] """
@@ -302,7 +316,6 @@ class Hi2:
         dposes = SE3(poses_pos).inv() * SE3(poses_pre)
         dscale = torch.ones(self.video.counter.value, 1)
         torch.cuda.empty_cache()
-        self._drain_online_scal3r_before_final_refinement()
 
         # final refinement
         self.call_gs(
@@ -345,11 +358,33 @@ def _to_int_or_none(value):
     return int(value)
 
 
-def _last_online_frame_id(video, counter):
+def _frame_ids_for_viz_idx(video, viz_idx):
     try:
-        count = int(counter)
-        if count <= 0:
-            return None
-        return int(video.tstamp[count - 1].item())
+        indices = viz_idx.detach().cpu().numpy().astype(int).tolist()
     except Exception:
-        return None
+        try:
+            indices = [int(item) for item in viz_idx]
+        except Exception:
+            return []
+    counter = int(video.counter.value)
+    frame_ids = []
+    for index in indices:
+        if 0 <= index < counter:
+            frame_ids.append(int(video.tstamp[index].item()))
+    return frame_ids
+
+
+def _apply_online_scal3r_cli_overrides(config, args):
+    if not getattr(args, "online_scal3r_block_until_ready", False) and (
+        getattr(args, "online_scal3r_block_timeout_sec", None) is None
+    ):
+        return
+
+    tracking = config.setdefault("Tracking", {})
+    frontend = tracking.setdefault("frontend", {})
+    online = frontend.setdefault("online_scal3r", {})
+    if getattr(args, "online_scal3r_block_until_ready", False):
+        online["block_until_prior_ready"] = True
+    timeout = getattr(args, "online_scal3r_block_timeout_sec", None)
+    if timeout is not None:
+        online["block_until_prior_timeout_sec"] = float(timeout)

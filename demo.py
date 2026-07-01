@@ -1,7 +1,6 @@
 import os    # nopep8
 import sys   # nopep8
 sys.path.append(os.path.join(os.path.dirname(__file__), 'hislam2'))   # nopep8
-import time
 import torch
 import cv2
 import re
@@ -50,7 +49,7 @@ def mono_stream(queue, imagedir, calib, undistort=False, cropborder=False, start
     for t, imfile in enumerate(image_list):
         image = cv2.imread(os.path.join(imagedir, imfile))
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        intrinsics = torch.tensor(calib[:4])
+        intrinsics = calib[:4].astype(np.float32, copy=True)
         if len(calib) > 4 and undistort:
             image = cv2.undistort(image, K, calib[4:])
         if cropborder > 0:
@@ -62,16 +61,56 @@ def mono_stream(queue, imagedir, calib, undistort=False, cropborder=False, start
         w1 = int(w0 * np.sqrt((RES) / (h0 * w0)))
         h1 = h1 - h1 % 8
         w1 = w1 - w1 % 8
-        image = cv2.resize(image, (w1, h1))
-        image = torch.as_tensor(image).permute(2, 0, 1)
+        image = np.ascontiguousarray(cv2.resize(image, (w1, h1)))
 
         intrinsics[[0,2]] *= (w1 / w0)
         intrinsics[[1,3]] *= (h1 / h0)
 
         is_last = (t == len(image_list)-1)
-        queue.put((t, image[None], intrinsics[None], is_last))
+        queue.put((t, image, intrinsics.copy(), is_last))
 
-    time.sleep(10)
+
+def _queue_payload_to_tensors(image, intrinsics):
+    """Rebuild Torch tensors in the consumer to avoid cross-process storage FDs."""
+
+    if isinstance(image, torch.Tensor):
+        image_tensor = image.detach().cpu()
+        if image_tensor.ndim == 3:
+            if image_tensor.shape[-1] == 3 and image_tensor.shape[0] != 3:
+                image_tensor = image_tensor.permute(2, 0, 1)
+            image_tensor = image_tensor.unsqueeze(0)
+        elif image_tensor.ndim == 4:
+            if image_tensor.shape[-1] == 3 and image_tensor.shape[1] != 3:
+                image_tensor = image_tensor.permute(0, 3, 1, 2)
+        else:
+            raise ValueError(f"expected image payload with 3 or 4 dims, got {tuple(image_tensor.shape)}")
+        image_tensor = image_tensor.contiguous()
+    else:
+        image_array = np.asarray(image)
+        if image_array.ndim == 3:
+            if image_array.shape[-1] == 3:
+                image_tensor = torch.from_numpy(np.ascontiguousarray(image_array)).permute(2, 0, 1).unsqueeze(0)
+            elif image_array.shape[0] == 3:
+                image_tensor = torch.from_numpy(np.ascontiguousarray(image_array)).unsqueeze(0)
+            else:
+                raise ValueError(f"expected 3-channel image payload, got shape {image_array.shape}")
+        elif image_array.ndim == 4:
+            if image_array.shape[-1] == 3:
+                image_tensor = torch.from_numpy(np.ascontiguousarray(image_array)).permute(0, 3, 1, 2)
+            elif image_array.shape[1] == 3:
+                image_tensor = torch.from_numpy(np.ascontiguousarray(image_array))
+            else:
+                raise ValueError(f"expected batched 3-channel image payload, got shape {image_array.shape}")
+        else:
+            raise ValueError(f"expected image payload with 3 or 4 dims, got shape {image_array.shape}")
+        image_tensor = image_tensor.contiguous()
+
+    intrinsics_tensor = torch.as_tensor(intrinsics, dtype=torch.float32).detach().cpu()
+    if intrinsics_tensor.ndim == 1:
+        intrinsics_tensor = intrinsics_tensor.unsqueeze(0)
+    elif intrinsics_tensor.ndim != 2:
+        raise ValueError(f"expected intrinsics payload with 1 or 2 dims, got {tuple(intrinsics_tensor.shape)}")
+    return image_tensor, intrinsics_tensor.contiguous()
 
 
 def save_trajectory(hi2, traj_full, imagedir, output, start=0):
@@ -131,6 +170,17 @@ if __name__ == '__main__':
     parser.add_argument("--droidvis", action="store_true")
     parser.add_argument("--gsvis", action="store_true")
     parser.add_argument(
+        "--online_scal3r_block_until_ready",
+        action="store_true",
+        help="temporarily block before GS updates until online Scal3R priors are ready",
+    )
+    parser.add_argument(
+        "--online_scal3r_block_timeout_sec",
+        type=float,
+        default=None,
+        help="timeout for temporary online Scal3R prior blocking",
+    )
+    parser.add_argument(
         "--save_dba_depth",
         nargs="?",
         const=True,
@@ -166,7 +216,8 @@ if __name__ == '__main__':
     args.buffer = min(1000, N // 10 + 150) if args.buffer < 0 else args.buffer
     pbar = tqdm(range(N), desc="Processing keyframes")
     while 1:
-        (t, image, intrinsics, is_last) = queue.get()
+        (t, image_payload, intrinsics_payload, is_last) = queue.get()
+        image, intrinsics = _queue_payload_to_tensors(image_payload, intrinsics_payload)
         pbar.update()
 
         if hi2 is None:
@@ -204,7 +255,12 @@ if __name__ == '__main__':
 
     reader.join()
 
-    traj = hi2.terminate()
+    try:
+        traj = hi2.terminate()
+    finally:
+        online_manager = None if hi2 is None else getattr(hi2, "online_scal3r_manager", None)
+        if online_manager is not None:
+            online_manager.shutdown()
     if args.save_dba_depth:
         save_dba_depths(hi2, args.output)
     save_trajectory(
