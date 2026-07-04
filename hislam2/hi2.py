@@ -208,15 +208,17 @@ class Hi2:
                     policy_current_frame_id=publish_policy_frame_id,
                 )
                 scheduled_chunk_ids = report.get("scheduled_chunks", [])
-                if scheduled_chunk_ids and getattr(manager.config, "require_all_keyframe_inference", False):
+                if scheduled_chunk_ids and getattr(manager.config, "wait_for_keyframe_inference", False):
                     wait_report = manager.wait_for_scheduled_chunks(
                         scheduled_chunk_ids,
                         current_frame_id=publish_policy_frame_id,
                     )
+                    wait_summary = _online_scal3r_wait_summary(wait_report)
                     print(
                         "[Online Scal3R] live keyframe inference "
                         f"chunks={scheduled_chunk_ids} "
-                        f"settled={wait_report['settled_chunk_ids']}"
+                        f"settled={wait_report['settled_chunk_ids']} "
+                        f"{wait_summary}"
                     )
             manager.poll(current_frame_id=poll_frame_id)
         except TimeoutError:
@@ -241,7 +243,8 @@ class Hi2:
             print(
                 "[Online Scal3R] blocking wait "
                 f"targets={frame_ids} ready={report['ready_frame_ids']} "
-                f"timed_out={report['timed_out']}"
+                f"timed_out={report['timed_out']} "
+                f"{_online_scal3r_wait_summary(report)}"
             )
             return report
         except Exception as exc:
@@ -372,6 +375,72 @@ def _frame_ids_for_viz_idx(video, viz_idx):
         if 0 <= index < counter:
             frame_ids.append(int(video.tstamp[index].item()))
     return frame_ids
+
+
+def _online_scal3r_wait_summary(report):
+    status_counts = _online_scal3r_status_counts(report)
+    timing = _online_scal3r_timing_totals(report)
+    parts = []
+    if status_counts:
+        parts.append(
+            "states="
+            + ",".join(f"{status}:{status_counts[status]}" for status in sorted(status_counts))
+        )
+    for label, value in (
+        ("worker", timing.get("worker_wall")),
+        ("runner", timing.get("runner_wall")),
+        ("backend", timing.get("backend_wall")),
+        ("align", timing.get("alignment_wall")),
+    ):
+        if value is not None:
+            parts.append(f"{label}={value:.2f}s")
+    return " ".join(parts)
+
+
+def _online_scal3r_status_counts(report):
+    alignment_results = report.get("alignment_results", []) or []
+    worker_results = report.get("worker_results", []) or []
+    alignment_chunk_ids = {
+        str(item.get("chunk_id"))
+        for item in alignment_results
+        if item.get("chunk_id") is not None
+    }
+    terminal_items = list(alignment_results)
+    terminal_items.extend(
+        item
+        for item in worker_results
+        if str(item.get("chunk_id")) not in alignment_chunk_ids
+    )
+    counts = {}
+    for item in terminal_items:
+        status = item.get("status")
+        if status is None:
+            continue
+        counts[str(status)] = counts.get(str(status), 0) + 1
+    return counts
+
+
+def _online_scal3r_timing_totals(report):
+    totals = {}
+    for item in (report.get("worker_results", []) or []):
+        timing = item.get("timing_sec", {}) or {}
+        for key in ("worker_wall", "runner_wall"):
+            value = timing.get(key)
+            if value is not None:
+                totals[key] = totals.get(key, 0.0) + float(value)
+        stages = item.get("stage_timings_sec", {}) or {}
+        if isinstance(stages, dict):
+            backend = stages.get("scal3r_backend", {}) or {}
+            if isinstance(backend, dict):
+                value = backend.get("model_postprocess_wall")
+                if value is not None:
+                    totals["backend_wall"] = totals.get("backend_wall", 0.0) + float(value)
+    for item in (report.get("alignment_results", []) or []):
+        timing = item.get("timing_sec", {}) or {}
+        value = timing.get("alignment_wall")
+        if value is not None:
+            totals["alignment_wall"] = totals.get("alignment_wall", 0.0) + float(value)
+    return totals
 
 
 def _apply_online_scal3r_cli_overrides(config, args):
