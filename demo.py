@@ -6,6 +6,7 @@ import cv2
 import re
 import os
 import argparse
+import time
 import numpy as np
 import lietorch
 import resource
@@ -128,6 +129,42 @@ def save_trajectory(hi2, traj_full, imagedir, output, start=0):
         np.savetxt(f"{output}/traj_full.txt", ttraj_full)
 
 
+def _count_nonempty_lines(path):
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            return sum(1 for line in handle if line.strip())
+    except OSError:
+        return None
+
+
+def _format_fps_report(frames_processed, elapsed_sec, frame_source):
+    frames = max(0, int(frames_processed))
+    elapsed = max(0.0, float(elapsed_sec))
+    minutes = elapsed / 60.0
+    fps = frames / elapsed if elapsed > 0.0 else 0.0
+    return (
+        f"Frames processed: {frames} ({frame_source})\n"
+        f"Main run elapsed time: {elapsed:.2f} s = {minutes:.2f} min\n"
+        f"FPS: {frames} / {elapsed:.2f} = {fps:.2f} FPS\n"
+    )
+
+
+def write_fps_report(output, frames_processed, elapsed_sec):
+    traj_full_path = os.path.join(output, "traj_full.txt")
+    traj_full_count = _count_nonempty_lines(traj_full_path)
+    if traj_full_count is not None:
+        frames = traj_full_count
+        frame_source = "traj_full.txt"
+    else:
+        frames = frames_processed
+        frame_source = "tracking loop"
+
+    fps_path = os.path.join(output, "fps.txt")
+    with open(fps_path, "w", encoding="utf-8") as handle:
+        handle.write(_format_fps_report(frames, elapsed_sec, frame_source))
+    return fps_path
+
+
 def save_dba_depths(hi2, output):
     depth_dir = os.path.join(output, "dba_depths")
     os.makedirs(depth_dir, exist_ok=True)
@@ -215,8 +252,13 @@ if __name__ == '__main__':
     N = len(os.listdir(args.imagedir))
     args.buffer = min(1000, N // 10 + 150) if args.buffer < 0 else args.buffer
     pbar = tqdm(range(N), desc="Processing keyframes")
+    frames_processed = 0
+    tracking_started_at = None
+    tracking_finished_at = None
     while 1:
         (t, image_payload, intrinsics_payload, is_last) = queue.get()
+        if tracking_started_at is None:
+            tracking_started_at = time.time()
         image, intrinsics = _queue_payload_to_tensors(image_payload, intrinsics_payload)
         pbar.update()
 
@@ -248,6 +290,8 @@ if __name__ == '__main__':
         pbar.set_description(
             f"Processing keyframe No [{hi2.video.counter.value}] with GS num [{hi2.gs.gaussians._xyz.shape[0]}]"
         )
+        frames_processed += 1
+        tracking_finished_at = time.time()
 
         if is_last:
             pbar.close()
@@ -270,5 +314,9 @@ if __name__ == '__main__':
         args.output, 
         start=args.start
     )
+    tracking_elapsed_sec = 0.0
+    if tracking_started_at is not None and tracking_finished_at is not None:
+        tracking_elapsed_sec = max(0.0, tracking_finished_at - tracking_started_at)
+    write_fps_report(args.output, frames_processed, tracking_elapsed_sec)
 
     print("Done")
