@@ -18,6 +18,43 @@ from torch.multiprocessing import Process, Queue
 from hi2 import Hi2
 
 
+IMAGE_SUFFIXES = (".png", ".jpg", ".jpeg", ".bmp")
+NUMERIC_TOKEN_RE = re.compile(r"[+]?(?:\d*\.\d+|\d+)")
+
+
+def extract_numeric_id(name):
+    matches = NUMERIC_TOKEN_RE.findall(name)
+    if not matches:
+        return None
+    return float(matches[-1])
+
+
+def image_sort_key(name):
+    numeric_id = extract_numeric_id(name)
+    if numeric_id is None:
+        return (1, name.lower(), name)
+    return (0, numeric_id, name.lower(), name)
+
+
+def list_image_files(imagedir):
+    image_files = [
+        name
+        for name in os.listdir(imagedir)
+        if os.path.isfile(os.path.join(imagedir, name)) and name.lower().endswith(IMAGE_SUFFIXES)
+    ]
+    return sorted(image_files, key=image_sort_key)
+
+
+def select_image_files(imagedir, start=0, length=100000):
+    image_files = list_image_files(imagedir)
+    return image_files[start:start + length]
+
+
+def image_timestamp(name, fallback):
+    numeric_id = extract_numeric_id(name)
+    return float(fallback) if numeric_id is None else numeric_id
+
+
 def show_image(image, depth_prior, depth, normal):
     from util.utils import colorize_np
     image = image[[2,1,0]].permute(1, 2, 0).cpu().numpy()
@@ -38,14 +75,15 @@ def show_image(image, depth_prior, depth, normal):
     cv2.waitKey(1)
 
 
-def mono_stream(queue, imagedir, calib, undistort=False, cropborder=False, start=0, length=100000):
+def mono_stream(queue, imagedir, calib, undistort=False, cropborder=False, start=0, length=100000, image_list=None):
     """ image generator """
     RES = 341 * 640
 
     calib = np.loadtxt(calib, delimiter=" ")
     K = np.array([[calib[0], 0, calib[2]],[0, calib[1], calib[3]],[0,0,1]])
 
-    image_list = sorted(os.listdir(imagedir))[start:start+length]
+    if image_list is None:
+        image_list = select_image_files(imagedir, start=start, length=length)
 
     for t, imfile in enumerate(image_list):
         image = cv2.imread(os.path.join(imagedir, imfile))
@@ -114,13 +152,15 @@ def _queue_payload_to_tensors(image, intrinsics):
     return image_tensor, intrinsics_tensor.contiguous()
 
 
-def save_trajectory(hi2, traj_full, imagedir, output, start=0):
+def save_trajectory(hi2, traj_full, imagedir, output, start=0, length=100000, image_list=None):
     t = hi2.video.counter.value
     tstamps = hi2.video.tstamp[:t]
     poses_wc = lietorch.SE3(hi2.video.poses[:t]).inv().data
     np.save("{}/intrinsics.npy".format(output), hi2.video.intrinsics[0].cpu().numpy()*8)
 
-    tstamps_full = np.array([float(re.findall(r"[+]?(?:\d*\.\d+|\d+)", x)[-1]) for x in sorted(os.listdir(imagedir))[start:]])[..., np.newaxis]
+    if image_list is None:
+        image_list = select_image_files(imagedir, start=start, length=length)
+    tstamps_full = np.array([image_timestamp(name, index) for index, name in enumerate(image_list)])[..., np.newaxis]
     tstamps_kf = tstamps_full[tstamps.cpu().numpy().astype(int)]
     ttraj_kf = np.concatenate([tstamps_kf, poses_wc.cpu().numpy()], axis=1)
     np.savetxt(f"{output}/traj_kf.txt", ttraj_kf)  # for evo evaluation 
@@ -241,15 +281,21 @@ if __name__ == '__main__':
     os.makedirs(args.output, exist_ok=True)
     torch.multiprocessing.set_start_method('spawn')
 
+    image_list = select_image_files(args.imagedir, start=args.start, length=args.length)
+    if not image_list:
+        raise ValueError(
+            f"No input images selected from {args.imagedir} with --start {args.start} and --length {args.length}"
+        )
+
     hi2 = None
     queue = Queue(maxsize=8)
     reader = Process(
         target=mono_stream, 
-        args=(queue, args.imagedir, args.calib, args.undistort, args.cropborder, args.start, args.length)
+        args=(queue, args.imagedir, args.calib, args.undistort, args.cropborder, args.start, args.length, image_list)
     )
     reader.start()
 
-    N = len(os.listdir(args.imagedir))
+    N = len(image_list)
     args.buffer = min(1000, N // 10 + 150) if args.buffer < 0 else args.buffer
     pbar = tqdm(range(N), desc="Processing keyframes")
     frames_processed = 0
@@ -312,7 +358,9 @@ if __name__ == '__main__':
         traj, 
         args.imagedir, 
         args.output, 
-        start=args.start
+        start=args.start,
+        length=args.length,
+        image_list=image_list,
     )
     tracking_elapsed_sec = 0.0
     if tracking_started_at is not None and tracking_finished_at is not None:
