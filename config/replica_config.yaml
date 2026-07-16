@@ -148,6 +148,12 @@ Training:
     pointmap_frame: scal3r
     pointmap_max_points: 20000
     pointmap_min_points: 128
+    pointmap_spatial_voxel_size: 0.02
+    pointmap_max_vertices_per_source: 20000
+    pointmap_max_total_vertices: 1810784
+    pointmap_max_candidate_work: 7463098
+    pointmap_max_estimated_memory_mib: 1768.34375
+    pointmap_estimated_bytes_per_vertex: 1024
     depth_rel_tolerance: 0.25
     allow_missing_depth: true
     min_camera_z: 0.01

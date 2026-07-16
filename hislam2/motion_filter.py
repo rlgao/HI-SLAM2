@@ -81,10 +81,19 @@ class MotionFilter:
         normal = normal.float().squeeze()
         return depth, normal
 
-    def apply_external_prior(self, tstamp, depth):
+    def apply_external_prior(self, tstamp, depth, consumer_phase="live"):
         if self.prior_provider is None:
             return depth, None
-        external = self.prior_provider.get_prior(int(tstamp), tuple(depth.shape[-2:]))
+        phase_getter = getattr(self.prior_provider, "get_prior_for_phase", None)
+        if callable(phase_getter):
+            external = phase_getter(
+                int(tstamp),
+                tuple(depth.shape[-2:]),
+                phase=consumer_phase,
+                consumer_path="frame_insertion",
+            )
+        else:
+            external = self.prior_provider.get_prior(int(tstamp), tuple(depth.shape[-2:]))
         if external is None:
             return depth, None
         external_depth = torch.as_tensor(external.depth, device=depth.device, dtype=depth.dtype)

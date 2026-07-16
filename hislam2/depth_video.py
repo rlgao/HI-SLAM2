@@ -17,6 +17,29 @@ def inverse_positive_depth(depth):
     inverse[valid] = 1.0 / depth[valid].float()
     return inverse
 
+
+_FRAME_STATE_FIELDS = (
+    "tstamp",
+    "images",
+    "dirty",
+    "poses",
+    "poses_sim3",
+    "disps",
+    "disps_prior",
+    "disps_up",
+    "disps_prior_up",
+    "disps_prior_conf",
+    "disps_prior_conf_up",
+    "intrinsics",
+    "normals",
+    "fmaps",
+    "nets",
+    "inps",
+    "dscales",
+    "doffset",
+)
+
+
 class DepthVideo:
     def __init__(self, config, image_size, buffer):
 
@@ -60,12 +83,27 @@ class DepthVideo:
     def get_lock(self):
         return self.counter.get_lock()
 
+    def _copy_frame_state(self, destination, source):
+        for field in _FRAME_STATE_FIELDS:
+            values = getattr(self, field)
+            values[destination] = values[source].clone()
+
+    def _initialize_frame_scale_state(self, index):
+        self.dscales[index] = 1.0
+        self.doffset[index] = 0.0
+
+    def copy_frame_state(self, destination, source):
+        with self.get_lock():
+            self._copy_frame_state(destination, source)
+
     def __item_setter(self, index, item):
         if isinstance(index, int) and index >= self.counter.value:
             self.counter.value = index + 1
         
         elif isinstance(index, torch.Tensor) and index.max().item() > self.counter.value:
             self.counter.value = index.max().item() + 1
+
+        self._initialize_frame_scale_state(index)
 
         # self.dirty[index] = True
         self.tstamp[index] = item[0]
@@ -135,22 +173,12 @@ class DepthVideo:
 
     def shift(self, ix, n=1):
         with self.get_lock():
-            self.tstamp[ix+n:self.counter.value+n] = self.tstamp[ix:self.counter.value].clone()
-            self.images[ix+n:self.counter.value+n] = self.images[ix:self.counter.value].clone()
-            self.dirty[ix+n:self.counter.value+n] = self.dirty[ix:self.counter.value].clone()
-            self.poses[ix+n:self.counter.value+n] = self.poses[ix:self.counter.value].clone()
-            self.poses_sim3[ix+n:self.counter.value+n] = self.poses_sim3[ix:self.counter.value].clone()
-            self.disps[ix+n:self.counter.value+n] = self.disps[ix:self.counter.value].clone()
-            self.disps_prior[ix+n:self.counter.value+n] = self.disps_prior[ix:self.counter.value].clone()
-            self.disps_up[ix+n:self.counter.value+n] = self.disps_up[ix:self.counter.value].clone()
-            self.disps_prior_up[ix+n:self.counter.value+n] = self.disps_prior_up[ix:self.counter.value].clone()
-            self.disps_prior_conf[ix+n:self.counter.value+n] = self.disps_prior_conf[ix:self.counter.value].clone()
-            self.disps_prior_conf_up[ix+n:self.counter.value+n] = self.disps_prior_conf_up[ix:self.counter.value].clone()
-            self.intrinsics[ix+n:self.counter.value+n] = self.intrinsics[ix:self.counter.value].clone()
-            self.normals[ix+n:self.counter.value+n] = self.normals[ix:self.counter.value].clone()
-            self.fmaps[ix+n:self.counter.value+n] = self.fmaps[ix:self.counter.value].clone()
-            self.nets[ix+n:self.counter.value+n] = self.nets[ix:self.counter.value].clone()
-            self.inps[ix+n:self.counter.value+n] = self.inps[ix:self.counter.value].clone()
+            self._copy_frame_state(
+                slice(ix + n, self.counter.value + n),
+                slice(ix, self.counter.value),
+            )
+            if n > 0:
+                self._initialize_frame_scale_state(slice(ix, ix + n))
             self.counter.value += n
 
     ### geometric operations ###

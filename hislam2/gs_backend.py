@@ -80,6 +80,7 @@ class GSBackEnd(mp.Process):
 
 
     def process_track_data(self, packet):
+        consumer_phase = str(packet.get("consumer_phase", "unspecified"))
         if not hasattr(self, "projection_matrix"):
             H, W = packet["images"].shape[-2:]
             self.K = K = list(packet["intrinsics"][0]) + [W, H]
@@ -124,16 +125,27 @@ class GSBackEnd(mp.Process):
                 if not self.initialized:
                     self.reset()
                     self.viewpoints[idx] = viewpoint
-                    self.add_next_kf(0, viewpoint, depth_map=packet["depths"][0].numpy(), init=True)
+                    self.add_next_kf(
+                        0,
+                        viewpoint,
+                        depth_map=packet["depths"][0].numpy(),
+                        init=True,
+                        consumer_phase=consumer_phase,
+                    )
                     self.initialize_map(0, viewpoint)
                     self.initialized = True
                 elif idx not in self.viewpoints:
                     self.viewpoints[idx] = viewpoint
-                    self.add_next_kf(idx, viewpoint, depth_map=packet["depths"][i].numpy())
+                    self.add_next_kf(
+                        idx,
+                        viewpoint,
+                        depth_map=packet["depths"][i].numpy(),
+                        consumer_phase=consumer_phase,
+                    )
                 else:
                     self.viewpoints[idx] = viewpoint
 
-        self.consume_ready_online_pointmap_priors()
+        self.consume_ready_online_pointmap_priors(consumer_phase=consumer_phase)
         self.map(self.current_window, iters=10)
         # self.map(self.current_window, iters=1, prune=True)
 
@@ -174,14 +186,35 @@ class GSBackEnd(mp.Process):
             iteration="after_opt", save_depth_npy=save_render_depth
         )
 
-    def add_next_kf(self, frame_idx, viewpoint, init=False, scale=2.0, depth_map=None):
+    def add_next_kf(
+        self,
+        frame_idx,
+        viewpoint,
+        init=False,
+        scale=2.0,
+        depth_map=None,
+        consumer_phase="unspecified",
+    ):
         if self.scal3r_gaussian_init_mode == "pointmap" and self.scal3r_gaussian_init_provider is not None:
-            before_count = int(self.gaussians.get_xyz.shape[0])
-            added = self._add_pointmap_gaussians(frame_idx, viewpoint, depth_map, before_count)
-            if added:
+            outcome = self._consume_pointmap_gaussian_source(
+                frame_idx,
+                viewpoint,
+                depth_map,
+                consumer_phase=consumer_phase,
+                consumer_path="regular",
+            )
+            if (
+                outcome in {"committed", "already_committed", "resource_skipped"}
+                and int(self.gaussians.get_xyz.shape[0]) > 0
+            ):
                 return
 
-        depth_map = self._select_gaussian_init_depth(frame_idx, viewpoint, depth_map)
+        depth_map = self._select_gaussian_init_depth(
+            frame_idx,
+            viewpoint,
+            depth_map,
+            consumer_phase=consumer_phase,
+        )
         before_count = int(self.gaussians.get_xyz.shape[0])
         self.gaussians.extend_from_pcd_seq(
             viewpoint, kf_id=frame_idx, init=init, scale=scale, depthmap=depth_map
@@ -239,7 +272,14 @@ class GSBackEnd(mp.Process):
         Log(f"Scal3R Gaussian initialization enabled mode={mode}", tag="Scal3R-GS")
         return provider
 
-    def _select_gaussian_init_depth(self, frame_idx, viewpoint, depth_map):
+    def _select_gaussian_init_depth(
+        self,
+        frame_idx,
+        viewpoint,
+        depth_map,
+        *,
+        consumer_phase="unspecified",
+    ):
         if depth_map is None:
             return depth_map
         if self.scal3r_gaussian_init_provider is None:
@@ -255,6 +295,8 @@ class GSBackEnd(mp.Process):
             dba_depth=depth_map,
             provider=self.scal3r_gaussian_init_provider,
             min_confident_pixels=self.scal3r_gaussian_init_min_pixels,
+            consumer_phase=consumer_phase,
+            consumer_path="regular",
         )
         self.gaussian_init_source_counts[selection.source] = (
             self.gaussian_init_source_counts.get(selection.source, 0) + 1
@@ -270,21 +312,138 @@ class GSBackEnd(mp.Process):
         )
         return selection.depth
 
-    def _add_pointmap_gaussians(self, frame_idx, viewpoint, depth_map, before_count):
+    def _consume_pointmap_gaussian_source(
+        self,
+        frame_idx,
+        viewpoint,
+        depth_map,
+        *,
+        consumer_phase="unspecified",
+        consumer_path="regular",
+    ):
+        provider = self.scal3r_gaussian_init_provider
+        reserve_source = getattr(provider, "reserve_source", None)
+        if not callable(reserve_source):
+            before_count = int(self.gaussians.get_xyz.shape[0])
+            vertex_delta, _ = self._add_pointmap_gaussians(
+                frame_idx,
+                viewpoint,
+                depth_map,
+                before_count,
+                reservation=None,
+                consumer_phase=consumer_phase,
+                consumer_path=consumer_path,
+            )
+            return "committed" if vertex_delta > 0 else "fallback"
+
+        frame_id = self._frame_id_for_prior(frame_idx, viewpoint)
+        reservation = reserve_source(
+            frame_id,
+            phase=consumer_phase,
+            consumer_path=consumer_path,
+        )
+        reservation_outcome = str(reservation.get("reservation_outcome", "busy"))
+        if reservation_outcome == "committed":
+            return "already_committed"
+        if reservation_outcome == "resource_skipped":
+            return "resource_skipped"
+        if reservation_outcome != "reserved":
+            return reservation_outcome
+
+        before_count = int(self.gaussians.get_xyz.shape[0])
+        try:
+            vertex_delta, fallback_reason = self._add_pointmap_gaussians(
+                frame_idx,
+                viewpoint,
+                depth_map,
+                before_count,
+                reservation=reservation,
+                consumer_phase=consumer_phase,
+                consumer_path=consumer_path,
+            )
+            vertex_delta = int(vertex_delta)
+            after_count = int(self.gaussians.get_xyz.shape[0])
+            observed_vertex_delta = after_count - before_count
+            if vertex_delta <= 0:
+                is_resource_stop = getattr(provider, "is_resource_stop", None)
+                skip_source = getattr(provider, "skip_source", None)
+                if (
+                    callable(is_resource_stop)
+                    and callable(skip_source)
+                    and is_resource_stop(fallback_reason)
+                ):
+                    skip_source(
+                        reservation,
+                        reason=fallback_reason or "resource_unknown",
+                    )
+                    return "resource_skipped"
+                provider.fail_source(
+                    reservation,
+                    reason=f"PointmapFallback: {fallback_reason or 'candidate_not_inserted'}",
+                )
+                return "fallback"
+            if observed_vertex_delta != vertex_delta:
+                raise RuntimeError(
+                    "Pointmap insertion delta mismatch: "
+                    f"reported={vertex_delta} observed={observed_vertex_delta}"
+                )
+            provider.commit_source(reservation, vertex_delta=vertex_delta)
+            return "committed"
+        except Exception as exc:
+            observed_vertex_delta = int(self.gaussians.get_xyz.shape[0]) - before_count
+            provider.fail_source(
+                reservation,
+                reason=f"{type(exc).__name__}: {exc}",
+                retryable=observed_vertex_delta == 0,
+                observed_vertex_delta=max(0, observed_vertex_delta),
+            )
+            raise
+
+    def _add_pointmap_gaussians(
+        self,
+        frame_idx,
+        viewpoint,
+        depth_map,
+        before_count,
+        *,
+        reservation,
+        consumer_phase,
+        consumer_path,
+    ):
         from gaussian.utils.general_utils import inverse_sigmoid
         from gaussian.utils.sh_utils import RGB2SH
         from simple_knn._C import distCUDA2
 
         frame_id = self._frame_id_for_prior(frame_idx, viewpoint)
-        selection = self.scal3r_gaussian_init_provider.select_candidates(
-            frame_id=frame_id,
-            camera=viewpoint,
-            dba_depth=depth_map,
+        selection_kwargs = {
+            "frame_id": frame_id,
+            "camera": viewpoint,
+            "dba_depth": depth_map,
+        }
+        if reservation is not None:
+            selection_kwargs.update(
+                phase=consumer_phase,
+                consumer_path=consumer_path,
+            )
+        selection = self.scal3r_gaussian_init_provider.select_candidates(**selection_kwargs)
+        prepare_insertion = getattr(
+            self.scal3r_gaussian_init_provider,
+            "prepare_insertion",
+            None,
         )
-        self.gaussian_init_source_counts[selection.source] = (
-            self.gaussian_init_source_counts.get(selection.source, 0) + 1
-        )
+        if selection.source == "scal3r_pointmap" and callable(prepare_insertion):
+            if reservation is None:
+                raise RuntimeError("Online pointmap resource policy requires a source reservation")
+            selection = prepare_insertion(
+                reservation,
+                selection,
+                existing_points=self.gaussians.get_xyz,
+                current_vertices=int(before_count),
+            )
         if selection.source != "scal3r_pointmap":
+            self.gaussian_init_source_counts[selection.source] = (
+                self.gaussian_init_source_counts.get(selection.source, 0) + 1
+            )
             conf_mean = "none" if selection.confidence_mean is None else f"{selection.confidence_mean:.4f}"
             conf_median = "none" if selection.confidence_median is None else f"{selection.confidence_median:.4f}"
             conf_min = "none" if selection.confidence_min is None else f"{selection.confidence_min:.4f}"
@@ -302,7 +461,7 @@ class GSBackEnd(mp.Process):
                 f"source_counts={self.gaussian_init_source_counts}",
                 tag="Scal3R-GS",
             )
-            return False
+            return 0, selection.fallback_reason
 
         fused_point_cloud = torch.from_numpy(selection.points).float().cuda()
         fused_color = RGB2SH(torch.from_numpy(selection.colors).float().cuda())
@@ -337,6 +496,16 @@ class GSBackEnd(mp.Process):
             frame_idx,
         )
         after_count = int(self.gaussians.get_xyz.shape[0])
+        vertex_delta = after_count - int(before_count)
+        expected_vertex_delta = int(selection.points.shape[0])
+        if vertex_delta != expected_vertex_delta:
+            raise RuntimeError(
+                "Pointmap insertion changed the Gaussian count by "
+                f"{vertex_delta}, expected {expected_vertex_delta}"
+            )
+        self.gaussian_init_source_counts[selection.source] = (
+            self.gaussian_init_source_counts.get(selection.source, 0) + 1
+        )
         conf_mean = "none" if selection.confidence_mean is None else f"{selection.confidence_mean:.4f}"
         conf_median = "none" if selection.confidence_median is None else f"{selection.confidence_median:.4f}"
         conf_min = "none" if selection.confidence_min is None else f"{selection.confidence_min:.4f}"
@@ -355,34 +524,45 @@ class GSBackEnd(mp.Process):
             f"source_counts={self.gaussian_init_source_counts}",
             tag="Scal3R-GS",
         )
-        return True
+        return vertex_delta, None
 
-    def consume_ready_online_pointmap_priors(self):
+    def consume_ready_online_pointmap_priors(self, *, consumer_phase="unspecified"):
         if not self._online_pointmap_backfill_enabled():
             return []
 
+        transactional = callable(
+            getattr(self.scal3r_gaussian_init_provider, "reserve_source", None)
+        )
+        attempted = getattr(self, "_online_pointmap_backfill_attempted", set())
         frame_ids = self.online_scal3r_manager.ready_prior_frame_ids(
             frame_ids=self.viewpoints.keys(),
-            exclude_frame_ids=self._online_pointmap_backfill_attempted,
+            exclude_frame_ids=None if transactional else attempted,
         )
         consumed = []
+        backfill_phase = "later_live" if consumer_phase == "live" else consumer_phase
         for frame_id in frame_ids:
             viewpoint = self.viewpoints.get(frame_id)
             if viewpoint is None:
                 continue
 
-            self._online_pointmap_backfill_attempted.add(frame_id)
-            before_count = int(self.gaussians.get_xyz.shape[0])
+            if not transactional:
+                attempted.add(frame_id)
             depth_map = self._viewpoint_depth_numpy(viewpoint)
             try:
-                added = self._add_pointmap_gaussians(frame_id, viewpoint, depth_map, before_count)
+                outcome = self._consume_pointmap_gaussian_source(
+                    frame_id,
+                    viewpoint,
+                    depth_map,
+                    consumer_phase=backfill_phase,
+                    consumer_path="late_backfill",
+                )
             except Exception as exc:
                 Log(
                     f"frame={frame_id} late_backfill_skipped={exc}",
                     tag="Scal3R-GS",
                 )
                 continue
-            if added:
+            if outcome == "committed":
                 consumed.append(frame_id)
 
         if consumed:

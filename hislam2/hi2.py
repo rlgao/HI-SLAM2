@@ -6,7 +6,7 @@ from lietorch import SE3
 from modules.droid_net import DroidNet
 from depth_video import DepthVideo
 from motion_filter import MotionFilter
-from track_frontend import TrackFrontend
+from track_frontend import TrackFrontend, resolve_scal3r_frontend_prior_policy
 from track_backend import TrackBackend
 from util.trajectory_filler import PoseTrajectoryFiller
 from util.utils import load_config
@@ -18,6 +18,74 @@ from pgo_buffer import PGOBuffer
 
 
 _USE_PUBLISHED_FRAME_ID = object()
+_ONLINE_FALLBACK = object()
+
+
+def _run_online_operation(
+    manager,
+    phase,
+    operation,
+    *,
+    frame_ids=None,
+    chunk_ids=None,
+):
+    try:
+        return operation()
+    except Exception as exc:
+        if getattr(exc, "_ffgs_online_failure_recorded", False):
+            raise
+        classifier = getattr(manager, "is_recoverable_integration_error", None)
+        try:
+            recoverable = bool(classifier(exc)) if callable(classifier) else False
+        except Exception as classification_exc:
+            add_note = getattr(exc, "add_note", None)
+            if callable(add_note):
+                add_note(f"online failure classification also failed: {classification_exc}")
+            raise exc.with_traceback(exc.__traceback__) from classification_exc
+        reason = str(getattr(exc, "reason", "") or exc)
+        recorder = getattr(manager, "record_integration_outcome", None)
+        if not callable(recorder):
+            add_note = getattr(exc, "add_note", None)
+            if callable(add_note):
+                add_note("online manager cannot persist integration failure attribution")
+            raise
+        try:
+            recorder(
+                phase=phase,
+                outcome="fallback" if recoverable else "fatal",
+                recoverable=recoverable,
+                reason=reason,
+                exception_class=type(exc).__name__,
+                message=str(exc),
+                frame_ids=[] if frame_ids is None else list(frame_ids),
+                chunk_ids=[] if chunk_ids is None else list(chunk_ids),
+                owner="hi2",
+            )
+        except Exception as attribution_exc:
+            add_note = getattr(exc, "add_note", None)
+            if callable(add_note):
+                add_note(f"online failure attribution also failed: {attribution_exc}")
+            raise exc.with_traceback(exc.__traceback__) from attribution_exc
+        if recoverable:
+            return _ONLINE_FALLBACK
+        raise
+
+
+def _record_online_fallback(manager, *, phase, reason, frame_ids=None, chunk_ids=None, message=None):
+    recorder = getattr(manager, "record_integration_outcome", None)
+    if not callable(recorder):
+        raise RuntimeError("online manager cannot persist fallback attribution")
+    return recorder(
+        phase=phase,
+        outcome="fallback",
+        recoverable=True,
+        reason=str(reason),
+        exception_class=None,
+        message=message,
+        frame_ids=[] if frame_ids is None else list(frame_ids),
+        chunk_ids=[] if chunk_ids is None else list(chunk_ids),
+        owner="hi2",
+    )
 
 
 class Hi2:
@@ -33,9 +101,13 @@ class Hi2:
         # store images, depth, poses, intrinsics (shared between processes)
         self.video = DepthVideo(config, args.image_size, args.buffer)
         frontend_config = config["Tracking"]["frontend"]
+        frontend_prior_policy = resolve_scal3r_frontend_prior_policy(frontend_config)
         self.online_scal3r_manager = self._build_online_scal3r_manager(config, args.output)
-        self.scal3r_prior_provider = self._build_scal3r_prior_provider(frontend_config)
-        self.video.use_scal3r_prior = self.scal3r_prior_provider is not None
+        self.scal3r_prior_provider = self._build_scal3r_prior_provider(
+            frontend_config,
+            frontend_prior_policy,
+        )
+        self.video.use_scal3r_prior = frontend_prior_policy["active"]
 
         # filter incoming frames so that there is enough motion
         self.filterx = MotionFilter(
@@ -46,7 +118,12 @@ class Hi2:
         )
 
         # frontend process
-        self.frontend = TrackFrontend(self.net, self.video, frontend_config)
+        self.frontend = TrackFrontend(
+            self.net,
+            self.video,
+            frontend_config,
+            scal3r_prior_policy=frontend_prior_policy,
+        )
 
         # backend process
         self.backend = TrackBackend(self.net, self.video, config["Tracking"]["backend"])
@@ -90,18 +167,17 @@ class Hi2:
         self.net.load_state_dict(state_dict)
         self.net.to("cuda:0").eval()
 
-    def _build_scal3r_prior_provider(self, frontend_config):
-        if (
-            self.online_scal3r_manager is not None
-            and self.online_scal3r_manager.config.consume_frontend_prior
-        ):
-            print("[Online Scal3R] frontend depth-prior consumer enabled")
+    def _build_scal3r_prior_provider(self, frontend_config, frontend_prior_policy):
+        if frontend_prior_policy["online"]:
+            print(
+                "[Online Scal3R] frontend depth-prior consumer enabled "
+                f"(effective gate, min confidence {frontend_prior_policy['min_confidence']})"
+            )
             return self.online_scal3r_manager.depth_prior_provider(consumer="frontend")
 
-        scal3r_config = frontend_config.get("scal3r_prior", {})
-        use_scal3r_prior = bool(frontend_config.get("use_scal3r_prior", scal3r_config.get("active", False)))
-        if not use_scal3r_prior:
+        if not frontend_prior_policy["active"]:
             return None
+        scal3r_config = frontend_config.get("scal3r_prior", {})
         from ffgs_slam.prior.hislam2_provider import Scal3RDepthPriorProvider
 
         provider = Scal3RDepthPriorProvider.from_config(scal3r_config)
@@ -113,7 +189,7 @@ class Hi2:
 
         return OnlineScal3RManager.from_config(config, output_path=output_path)
 
-    def call_gs(self, viz_idx, dposes=None, dscale=None):
+    def call_gs(self, viz_idx, dposes=None, dscale=None, consumer_phase="live"):
         data = {
             'viz_idx':  viz_idx.to(device='cpu'),
             'tstamp':   self.video.tstamp[viz_idx].to(device='cpu'),
@@ -123,7 +199,8 @@ class Hi2:
             'depths':   1./self.video.disps_up[viz_idx.cpu()],
             'intrinsics':   self.video.intrinsics[viz_idx].to(device='cpu') * 8,
             'pose_updates':  dposes.to(device='cpu') if dposes is not None else None,
-            'scale_updates': dscale.to(device='cpu') if dscale is not None else None
+            'scale_updates': dscale.to(device='cpu') if dscale is not None else None,
+            'consumer_phase': str(consumer_phase),
         }
         self.gs.process_track_data(data)
 
@@ -166,90 +243,171 @@ class Hi2:
         if manager is None:
             return
 
-        try:
-            counter = int(self.video.counter.value)
-            if counter <= 0:
-                poll_frame_id = (
-                    _to_int_or_none(current_frame_id)
-                    if policy_current_frame_id is _USE_PUBLISHED_FRAME_ID
-                    else _to_int_or_none(policy_current_frame_id)
+        context_frame_ids = _run_online_operation(
+            manager,
+            "keyframe_publication",
+            lambda: _online_context_frame_ids(current_frame_id),
+        )
+        if context_frame_ids is _ONLINE_FALLBACK:
+            return None
+        control = _run_online_operation(
+            manager,
+            "keyframe_publication",
+            lambda: _online_publication_control(
+                self.video,
+                current_frame_id,
+                policy_current_frame_id,
+            ),
+            frame_ids=context_frame_ids,
+        )
+        if control is _ONLINE_FALLBACK:
+            return None
+        counter, poll_frame_id = control
+        if counter <= 0:
+            sync_live_keyframes = getattr(manager, "sync_live_keyframes", None)
+            if callable(sync_live_keyframes):
+                sync_result = _run_online_operation(
+                    manager,
+                    "keyframe_publication",
+                    lambda: sync_live_keyframes([]),
+                    frame_ids=context_frame_ids,
                 )
-                manager.poll(current_frame_id=poll_frame_id)
-                return
-
-            indices = torch.arange(0, counter, device="cuda")
-            poses_w2c = SE3(self.video.poses[indices]).matrix().detach().cpu()
-            tstamps = self.video.tstamp[:counter].detach().cpu()
-            intrinsics = (self.video.intrinsics[:counter].detach().cpu() * 8.0)
-            images = self.video.images[torch.arange(0, counter)].detach().cpu()
-            dba_depths = _online_dba_depths(self.video, counter)
-            poll_frame_id = (
-                _to_int_or_none(current_frame_id)
-                if policy_current_frame_id is _USE_PUBLISHED_FRAME_ID
-                else _to_int_or_none(policy_current_frame_id)
+                if sync_result is _ONLINE_FALLBACK:
+                    return None
+            _run_online_operation(
+                manager,
+                "keyframe_publication",
+                lambda: manager.poll(current_frame_id=poll_frame_id),
+                frame_ids=context_frame_ids,
             )
+            return None
 
-            for local_index in range(counter):
-                frame_id = int(tstamps[local_index].item())
-                publish_policy_frame_id = (
-                    frame_id
-                    if policy_current_frame_id is _USE_PUBLISHED_FRAME_ID
-                    else poll_frame_id
-                )
-                dba_depth = None if dba_depths is None else dba_depths[local_index]
-                report = manager.publish_keyframe(
+        snapshot = _run_online_operation(
+            manager,
+            "dba_snapshot",
+            lambda: _online_keyframe_snapshot(self.video, counter),
+            frame_ids=context_frame_ids,
+        )
+        if snapshot is _ONLINE_FALLBACK:
+            return None
+        poses_w2c, tstamps, intrinsics, images, dba_depths, live_frame_ids = snapshot
+        sync_live_keyframes = getattr(manager, "sync_live_keyframes", None)
+        if callable(sync_live_keyframes):
+            sync_result = _run_online_operation(
+                manager,
+                "keyframe_publication",
+                lambda: sync_live_keyframes(live_frame_ids),
+                frame_ids=live_frame_ids,
+            )
+            if sync_result is _ONLINE_FALLBACK:
+                return None
+
+        for local_index in range(counter):
+            frame_id = live_frame_ids[local_index]
+            publish_policy_frame_id = (
+                frame_id
+                if policy_current_frame_id is _USE_PUBLISHED_FRAME_ID
+                else poll_frame_id
+            )
+            report = _run_online_operation(
+                manager,
+                "keyframe_publication",
+                lambda: manager.publish_keyframe(
                     frame_id=frame_id,
                     keyframe_index=local_index,
                     image=images[local_index],
                     intrinsics=intrinsics[local_index],
                     pose_w2c=poses_w2c[local_index],
-                    dba_depth=dba_depth,
+                    dba_depth=dba_depths[local_index],
                     metadata={"source": "hislam2_depth_video"},
                     policy_current_frame_id=publish_policy_frame_id,
-                )
-                scheduled_chunk_ids = report.get("scheduled_chunks", [])
-                if scheduled_chunk_ids and getattr(manager.config, "wait_for_keyframe_inference", False):
-                    wait_report = manager.wait_for_scheduled_chunks(
+                ),
+                frame_ids=[frame_id],
+            )
+            if report is _ONLINE_FALLBACK:
+                return None
+            scheduled_chunk_ids = report.get("scheduled_chunks", [])
+            if scheduled_chunk_ids and getattr(manager.config, "wait_for_keyframe_inference", False):
+                wait_report = _run_online_operation(
+                    manager,
+                    "keyframe_wait",
+                    lambda: manager.wait_for_scheduled_chunks(
                         scheduled_chunk_ids,
                         current_frame_id=publish_policy_frame_id,
-                    )
-                    wait_summary = _online_scal3r_wait_summary(wait_report)
-                    print(
-                        "[Online Scal3R] live keyframe inference "
-                        f"chunks={scheduled_chunk_ids} "
-                        f"settled={wait_report['settled_chunk_ids']} "
-                        f"{wait_summary}"
-                    )
-            manager.poll(current_frame_id=poll_frame_id)
-        except TimeoutError:
-            raise
-        except Exception as exc:
-            print(f"[Online Scal3R] publish/poll skipped: {exc}")
+                    ),
+                    frame_ids=[frame_id],
+                    chunk_ids=scheduled_chunk_ids,
+                )
+                if wait_report is _ONLINE_FALLBACK:
+                    return None
+                wait_summary = _online_scal3r_wait_summary(wait_report)
+                print(
+                    "[Online Scal3R] live keyframe inference "
+                    f"chunks={scheduled_chunk_ids} "
+                    f"settled={wait_report['settled_chunk_ids']} "
+                    f"{wait_summary}"
+                )
+        _run_online_operation(
+            manager,
+            "keyframe_publication",
+            lambda: manager.poll(current_frame_id=poll_frame_id),
+            frame_ids=live_frame_ids,
+        )
+        return None
 
     def _block_until_online_prior_ready(self, viz_idx, current_frame_id=None):
         manager = self.online_scal3r_manager
         if manager is None or not manager.config.block_until_prior_ready:
             return None
 
-        frame_ids = _frame_ids_for_viz_idx(self.video, viz_idx)
+        context_frame_ids = _run_online_operation(
+            manager,
+            "blocking_wait",
+            lambda: _online_context_frame_ids(current_frame_id),
+        )
+        if context_frame_ids is _ONLINE_FALLBACK:
+            return None
+        frame_ids = _run_online_operation(
+            manager,
+            "blocking_wait",
+            lambda: _frame_ids_for_viz_idx(self.video, viz_idx),
+            frame_ids=context_frame_ids,
+        )
+        if frame_ids is _ONLINE_FALLBACK:
+            return None
         if not frame_ids:
             return None
 
-        try:
-            report = manager.block_until_prior_ready(
+        report = _run_online_operation(
+            manager,
+            "blocking_wait",
+            lambda: manager.block_until_prior_ready(
                 frame_ids=frame_ids,
                 current_frame_id=_to_int_or_none(current_frame_id),
-            )
-            print(
-                "[Online Scal3R] blocking wait "
-                f"targets={frame_ids} ready={report['ready_frame_ids']} "
-                f"timed_out={report['timed_out']} "
-                f"{_online_scal3r_wait_summary(report)}"
-            )
-            return report
-        except Exception as exc:
-            print(f"[Online Scal3R] blocking wait skipped: {exc}")
+            ),
+            frame_ids=frame_ids,
+        )
+        if report is _ONLINE_FALLBACK:
             return None
+        print(
+            "[Online Scal3R] blocking wait "
+            f"targets={frame_ids} ready={report['ready_frame_ids']} "
+            f"timed_out={report['timed_out']} "
+            f"{_online_scal3r_wait_summary(report)}"
+        )
+        if not report["ready_frame_ids"]:
+            reason = "blocking_wait_timeout" if report["timed_out"] else "prior_not_ready"
+            _record_online_fallback(
+                manager,
+                phase="blocking_wait",
+                reason=reason,
+                frame_ids=frame_ids,
+                message=(
+                    f"No ready online prior for frames {frame_ids}; "
+                    f"timed_out={report['timed_out']}"
+                ),
+            )
+        return report
 
     def terminate(self):
         """ terminate the visualization process, return poses [t, q] """
@@ -260,7 +418,8 @@ class Hi2:
                 self.call_gs(
                     torch.arange(0, self.video.counter.value, device='cuda'),
                     dposes, 
-                    dscale
+                    dscale,
+                    consumer_phase="termination",
                 )
             self.mp_backend.terminate()
         del self.frontend
@@ -294,7 +453,11 @@ class Hi2:
                 place = (self.video.tstamp > ind).nonzero()[0].item()
                 self.video.shift(place)
                 depth, normal = self.filterx.prior_extractor(inputs[i])
-                depth, prior_conf = self.filterx.apply_external_prior(ind, depth)
+                depth, prior_conf = self.filterx.apply_external_prior(
+                    ind,
+                    depth,
+                    consumer_phase="termination",
+                )
                 self.video[place] = (
                     ind, 
                     images[i], 
@@ -324,7 +487,8 @@ class Hi2:
         self.call_gs(
             torch.arange(0, self.video.counter.value, device='cuda'), 
             dposes, 
-            dscale
+            dscale,
+            consumer_phase="termination",
         )
         updated_poses = self.gs.finalize()
         self.video.poses[:self.video.counter.value] = torch.tensor(updated_poses[:,1:])
@@ -343,13 +507,36 @@ class Hi2:
         return traj_full.inv().data.cpu().numpy()
 
 
+def _online_context_frame_ids(frame_id):
+    normalized = _to_int_or_none(frame_id)
+    return [] if normalized is None else [normalized]
+
+
+def _online_publication_control(video, current_frame_id, policy_current_frame_id):
+    counter = int(video.counter.value)
+    poll_frame_id = (
+        _to_int_or_none(current_frame_id)
+        if policy_current_frame_id is _USE_PUBLISHED_FRAME_ID
+        else _to_int_or_none(policy_current_frame_id)
+    )
+    return counter, poll_frame_id
+
+
+def _online_keyframe_snapshot(video, counter):
+    indices = torch.arange(0, counter, device="cuda")
+    poses_w2c = SE3(video.poses[indices]).matrix().detach().cpu()
+    tstamps = video.tstamp[:counter].detach().cpu()
+    intrinsics = video.intrinsics[:counter].detach().cpu() * 8.0
+    images = video.images[torch.arange(0, counter)].detach().cpu()
+    dba_depths = _online_dba_depths(video, counter)
+    live_frame_ids = [int(tstamps[local_index].item()) for local_index in range(counter)]
+    return poses_w2c, tstamps, intrinsics, images, dba_depths, live_frame_ids
+
+
 def _online_dba_depths(video, counter):
-    try:
-        disps = video.disps_up[:counter].detach().cpu()
-        valid = torch.isfinite(disps) & (disps > 0)
-        return torch.where(valid, 1.0 / disps, torch.zeros_like(disps)).numpy()
-    except Exception:
-        return None
+    disps = video.disps_up[:counter].detach().cpu()
+    valid = torch.isfinite(disps) & (disps > 0)
+    return torch.where(valid, 1.0 / disps, torch.zeros_like(disps)).numpy()
 
 
 def _to_int_or_none(value):
@@ -362,13 +549,10 @@ def _to_int_or_none(value):
 
 
 def _frame_ids_for_viz_idx(video, viz_idx):
-    try:
+    if hasattr(viz_idx, "detach"):
         indices = viz_idx.detach().cpu().numpy().astype(int).tolist()
-    except Exception:
-        try:
-            indices = [int(item) for item in viz_idx]
-        except Exception:
-            return []
+    else:
+        indices = [int(item) for item in viz_idx]
     counter = int(video.counter.value)
     frame_ids = []
     for index in indices:

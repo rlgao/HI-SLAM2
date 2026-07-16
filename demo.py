@@ -10,6 +10,7 @@ import time
 import numpy as np
 import lietorch
 import resource
+from queue import Empty
 rlimit = resource.getrlimit(resource.RLIMIT_NOFILE)
 resource.setrlimit(resource.RLIMIT_NOFILE, (100000, rlimit[1]))
 
@@ -20,6 +21,115 @@ from hi2 import Hi2
 
 IMAGE_SUFFIXES = (".png", ".jpg", ".jpeg", ".bmp")
 NUMERIC_TOKEN_RE = re.compile(r"[+]?(?:\d*\.\d+|\d+)")
+READER_PAYLOAD_TIMEOUT_SEC = 60.0
+READER_POLL_INTERVAL_SEC = 0.25
+READER_JOIN_TIMEOUT_SEC = 5.0
+
+
+class _DemoLifecycle:
+    def __init__(self, queue, reader):
+        self.queue = queue
+        self.reader = reader
+        self.hi2 = None
+        self.progress = None
+        self._reader_started = False
+        self._reader_joined = False
+        self._queue_closed = False
+        self._progress_closed = False
+        self._online_manager_shutdown = False
+
+    def start_reader(self):
+        self.reader.start()
+        self._reader_started = True
+
+    def attach_hi2(self, hi2):
+        self.hi2 = hi2
+
+    def attach_progress(self, progress):
+        self.progress = progress
+
+    def get_reader_payload(self):
+        deadline = time.monotonic() + READER_PAYLOAD_TIMEOUT_SEC
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(
+                    f"image reader produced no payload within {READER_PAYLOAD_TIMEOUT_SEC:.1f} seconds"
+                )
+            try:
+                return self.queue.get(timeout=min(READER_POLL_INTERVAL_SEC, remaining))
+            except Empty:
+                if not self.reader.is_alive():
+                    raise RuntimeError(
+                        "image reader exited before providing the next frame "
+                        f"(exit code {self.reader.exitcode})"
+                    )
+
+    def join_reader(self, *, force=False):
+        if not self._reader_started or self._reader_joined:
+            return
+        if force and self.reader.is_alive():
+            self.reader.terminate()
+        self.reader.join(timeout=READER_JOIN_TIMEOUT_SEC)
+        if self.reader.is_alive():
+            if not force:
+                self.reader.terminate()
+                self.reader.join(timeout=READER_JOIN_TIMEOUT_SEC)
+            if self.reader.is_alive():
+                kill = getattr(self.reader, "kill", None)
+                if callable(kill):
+                    kill()
+                    self.reader.join(timeout=READER_JOIN_TIMEOUT_SEC)
+        if self.reader.is_alive():
+            raise RuntimeError("image reader did not exit during bounded cleanup")
+        self._reader_joined = True
+
+    def close_progress(self):
+        if self.progress is None or self._progress_closed:
+            return
+        self._progress_closed = True
+        self.progress.close()
+
+    def close_queue(self):
+        if self._queue_closed:
+            return
+        self._queue_closed = True
+        cancel_join_thread = getattr(self.queue, "cancel_join_thread", None)
+        if callable(cancel_join_thread):
+            cancel_join_thread()
+        self.queue.close()
+
+    def mark_online_manager_shutdown(self):
+        self._online_manager_shutdown = True
+
+    def shutdown_online_manager(self):
+        if self._online_manager_shutdown:
+            return
+        self._online_manager_shutdown = True
+        manager = None if self.hi2 is None else getattr(self.hi2, "online_scal3r_manager", None)
+        if manager is not None:
+            manager.shutdown()
+
+    def close(self, *, preserve_exception=False):
+        cleanup_errors = []
+        actions = (
+            lambda: self.join_reader(force=True),
+            self.shutdown_online_manager,
+            self.close_progress,
+            self.close_queue,
+        )
+        for action in actions:
+            try:
+                action()
+            except Exception as exc:
+                cleanup_errors.append(exc)
+        if not cleanup_errors:
+            return
+        if preserve_exception:
+            for exc in cleanup_errors:
+                print(f"Demo cleanup failed: {exc}", file=sys.stderr)
+            return
+        raise cleanup_errors[0]
 
 
 def extract_numeric_id(name):
@@ -293,78 +403,80 @@ if __name__ == '__main__':
         target=mono_stream, 
         args=(queue, args.imagedir, args.calib, args.undistort, args.cropborder, args.start, args.length, image_list)
     )
-    reader.start()
-
-    N = len(image_list)
-    args.buffer = min(1000, N // 10 + 150) if args.buffer < 0 else args.buffer
-    pbar = tqdm(range(N), desc="Processing keyframes")
-    frames_processed = 0
-    tracking_started_at = None
-    tracking_finished_at = None
-    while 1:
-        (t, image_payload, intrinsics_payload, is_last) = queue.get()
-        if tracking_started_at is None:
-            tracking_started_at = time.time()
-        image, intrinsics = _queue_payload_to_tensors(image_payload, intrinsics_payload)
-        pbar.update()
-
-        if hi2 is None:
-            args.image_size = [image.shape[2], image.shape[3]]
-            hi2 = Hi2(args)
-
-        hi2.track(
-            t, 
-            image, 
-            intrinsics=intrinsics, 
-            is_last=is_last
-        )
-
-        if args.droidvis and hi2.video.tstamp[hi2.video.counter.value-1] == t:
-            from geom.ba import get_prior_depth_aligned
-            index = hi2.video.counter.value-2
-            depth_prior, _ = get_prior_depth_aligned(
-                hi2.video.disps_prior_up[index][None].cuda(), 
-                hi2.video.dscales[index][None]
-            )
-            show_image(
-                image[0],
-                1./depth_prior.squeeze(), 
-                1./hi2.video.disps_up[index],
-                hi2.video.normals[index]
-            )
-            
-        pbar.set_description(
-            f"Processing keyframe No [{hi2.video.counter.value}] with GS num [{hi2.gs.gaussians._xyz.shape[0]}]"
-        )
-        frames_processed += 1
-        tracking_finished_at = time.time()
-
-        if is_last:
-            pbar.close()
-            break
-
-    reader.join()
-
+    lifecycle = _DemoLifecycle(queue, reader)
     try:
-        traj = hi2.terminate()
-    finally:
-        online_manager = None if hi2 is None else getattr(hi2, "online_scal3r_manager", None)
-        if online_manager is not None:
-            online_manager.shutdown()
-    if args.save_dba_depth:
-        save_dba_depths(hi2, args.output)
-    save_trajectory(
-        hi2, 
-        traj, 
-        args.imagedir, 
-        args.output, 
-        start=args.start,
-        length=args.length,
-        image_list=image_list,
-    )
-    tracking_elapsed_sec = 0.0
-    if tracking_started_at is not None and tracking_finished_at is not None:
-        tracking_elapsed_sec = max(0.0, tracking_finished_at - tracking_started_at)
-    write_fps_report(args.output, frames_processed, tracking_elapsed_sec)
+        lifecycle.start_reader()
 
-    print("Done")
+        N = len(image_list)
+        args.buffer = min(1000, N // 10 + 150) if args.buffer < 0 else args.buffer
+        pbar = tqdm(range(N), desc="Processing keyframes")
+        lifecycle.attach_progress(pbar)
+        frames_processed = 0
+        tracking_started_at = None
+        tracking_finished_at = None
+        while 1:
+            (t, image_payload, intrinsics_payload, is_last) = lifecycle.get_reader_payload()
+            if tracking_started_at is None:
+                tracking_started_at = time.time()
+            image, intrinsics = _queue_payload_to_tensors(image_payload, intrinsics_payload)
+            pbar.update()
+
+            if hi2 is None:
+                args.image_size = [image.shape[2], image.shape[3]]
+                hi2 = Hi2(args)
+                lifecycle.attach_hi2(hi2)
+
+            hi2.track(
+                t,
+                image,
+                intrinsics=intrinsics,
+                is_last=is_last
+            )
+
+            if args.droidvis and hi2.video.tstamp[hi2.video.counter.value-1] == t:
+                from geom.ba import get_prior_depth_aligned
+                index = hi2.video.counter.value-2
+                depth_prior, _ = get_prior_depth_aligned(
+                    hi2.video.disps_prior_up[index][None].cuda(),
+                    hi2.video.dscales[index][None]
+                )
+                show_image(
+                    image[0],
+                    1./depth_prior.squeeze(),
+                    1./hi2.video.disps_up[index],
+                    hi2.video.normals[index]
+                )
+
+            pbar.set_description(
+                f"Processing keyframe No [{hi2.video.counter.value}] with GS num [{hi2.gs.gaussians._xyz.shape[0]}]"
+            )
+            frames_processed += 1
+            tracking_finished_at = time.time()
+
+            if is_last:
+                lifecycle.close_progress()
+                break
+
+        lifecycle.join_reader()
+        lifecycle.close_queue()
+        traj = hi2.terminate()
+        lifecycle.mark_online_manager_shutdown()
+        if args.save_dba_depth:
+            save_dba_depths(hi2, args.output)
+        save_trajectory(
+            hi2,
+            traj,
+            args.imagedir,
+            args.output,
+            start=args.start,
+            length=args.length,
+            image_list=image_list,
+        )
+        tracking_elapsed_sec = 0.0
+        if tracking_started_at is not None and tracking_finished_at is not None:
+            tracking_elapsed_sec = max(0.0, tracking_finished_at - tracking_started_at)
+        write_fps_report(args.output, frames_processed, tracking_elapsed_sec)
+
+        print("Done")
+    finally:
+        lifecycle.close(preserve_exception=sys.exc_info()[0] is not None)

@@ -6,8 +6,32 @@ from lietorch import SE3
 from factor_graph import FactorGraph
 
 
+def resolve_scal3r_frontend_prior_policy(config):
+    scal3r_config = config.get("scal3r_prior", {}) or {}
+    legacy_active = bool(config.get("use_scal3r_prior", scal3r_config.get("active", False)))
+
+    online_config = config.get("online_scal3r", {}) or {}
+    online_active = bool(online_config.get("active", False)) and bool(
+        online_config.get(
+            "consume_frontend_prior",
+            online_config.get("use_frontend_prior", False),
+        )
+    )
+    effective_config = dict(scal3r_config)
+    if online_active:
+        effective_config.update(online_config.get("frontend_prior", {}) or {})
+
+    return {
+        "active": online_active or legacy_active,
+        "online": online_active,
+        "min_confidence": float(effective_config.get("min_confidence", 0.0)),
+        "min_confident_pixels": int(effective_config.get("min_confident_pixels", 128)),
+        "initialize_dscale": str(effective_config.get("initialize_dscale", "median_ratio")),
+    }
+
+
 class TrackFrontend:
-    def __init__(self, net, video, config):
+    def __init__(self, net, video, config, scal3r_prior_policy=None):
         self.video = video
         self.update_op = net.update
         self.graph = FactorGraph(video, net.update, max_factors=48)
@@ -27,11 +51,11 @@ class TrackFrontend:
         self.frontend_thresh = config["frontend_thresh"]
         self.frontend_radius = config["frontend_radius"]
         self.video.mono_depth_alpha = config["mono_depth_alpha"]
-        scal3r_config = config.get("scal3r_prior", {})
-        self.use_scal3r_prior = bool(config.get("use_scal3r_prior", scal3r_config.get("active", False)))
-        self.min_prior_confidence = float(scal3r_config.get("min_confidence", 0.0))
-        self.min_confident_pixels = int(scal3r_config.get("min_confident_pixels", 128))
-        self.initialize_dscale = str(scal3r_config.get("initialize_dscale", "median_ratio"))
+        prior_policy = scal3r_prior_policy or resolve_scal3r_frontend_prior_policy(config)
+        self.use_scal3r_prior = bool(prior_policy["active"])
+        self.min_prior_confidence = float(prior_policy["min_confidence"])
+        self.min_confident_pixels = int(prior_policy["min_confident_pixels"])
+        self.initialize_dscale = str(prior_policy["initialize_dscale"])
         if self.initialize_dscale != "median_ratio":
             raise ValueError("scal3r_prior.initialize_dscale currently supports only 'median_ratio'")
 

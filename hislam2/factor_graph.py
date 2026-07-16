@@ -155,21 +155,7 @@ class FactorGraph:
     def rm_keyframe(self, ix):
         """ drop edges from factor graph """
 
-        with self.video.get_lock():
-            self.video.tstamp[ix] = self.video.tstamp[ix+1]
-            self.video.images[ix] = self.video.images[ix+1]
-            self.video.poses[ix] = self.video.poses[ix+1]
-            self.video.disps[ix] = self.video.disps[ix+1]
-            self.video.disps_up[ix] = self.video.disps_up[ix+1]
-            self.video.disps_prior[ix] = self.video.disps_prior[ix+1]
-            self.video.disps_prior_up[ix] = self.video.disps_prior_up[ix+1]
-            self.video.disps_prior_conf[ix] = self.video.disps_prior_conf[ix+1]
-            self.video.disps_prior_conf_up[ix] = self.video.disps_prior_conf_up[ix+1]
-            self.video.intrinsics[ix] = self.video.intrinsics[ix+1]
-            self.video.normals[ix] = self.video.normals[ix+1]
-            self.video.nets[ix] = self.video.nets[ix+1]
-            self.video.inps[ix] = self.video.inps[ix+1]
-            self.video.fmaps[ix] = self.video.fmaps[ix+1]
+        self.video.copy_frame_state(ix, ix + 1)
 
         m = (self.ii_inac == ix) | (self.jj_inac == ix)
         self.ii_inac[self.ii_inac >= ix] -= 1

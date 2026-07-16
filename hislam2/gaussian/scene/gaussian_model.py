@@ -400,36 +400,56 @@ class GaussianModel:
         self.n_obs = self.n_obs[valid_points_mask.cpu()]
 
     def cat_tensors_to_optimizer(self, tensors_dict):
-        optimizable_tensors = {}
+        staged_groups = []
         for group in self.optimizer.param_groups:
             assert len(group["params"]) == 1
             extension_tensor = tensors_dict[group["name"]]
-            stored_state = self.optimizer.state.get(group["params"][0], None)
+            old_parameter = group["params"][0]
+            stored_state = self.optimizer.state.get(old_parameter, None)
+            new_parameter = nn.Parameter(
+                torch.cat((old_parameter, extension_tensor), dim=0).requires_grad_(True)
+            )
+            new_state = None
             if stored_state is not None:
-                stored_state["exp_avg"] = torch.cat(
+                new_state = dict(stored_state)
+                new_state["exp_avg"] = torch.cat(
                     (stored_state["exp_avg"], torch.zeros_like(extension_tensor)), dim=0
                 )
-                stored_state["exp_avg_sq"] = torch.cat(
+                new_state["exp_avg_sq"] = torch.cat(
                     (stored_state["exp_avg_sq"], torch.zeros_like(extension_tensor)),
                     dim=0,
                 )
 
-                del self.optimizer.state[group["params"][0]]
-                group["params"][0] = nn.Parameter(
-                    torch.cat(
-                        (group["params"][0], extension_tensor), dim=0
-                    ).requires_grad_(True)
-                )
-                self.optimizer.state[group["params"][0]] = stored_state
+            staged_groups.append(
+                {
+                    "group": group,
+                    "name": group["name"],
+                    "old_parameter": old_parameter,
+                    "old_state": stored_state,
+                    "had_state": old_parameter in self.optimizer.state,
+                    "new_parameter": new_parameter,
+                    "new_state": new_state,
+                }
+            )
 
-                optimizable_tensors[group["name"]] = group["params"][0]
-            else:
-                group["params"][0] = nn.Parameter(
-                    torch.cat(
-                        (group["params"][0], extension_tensor), dim=0
-                    ).requires_grad_(True)
-                )
-                optimizable_tensors[group["name"]] = group["params"][0]
+        optimizable_tensors = {}
+        try:
+            for staged in staged_groups:
+                old_parameter = staged["old_parameter"]
+                new_parameter = staged["new_parameter"]
+                if staged["had_state"]:
+                    del self.optimizer.state[old_parameter]
+                staged["group"]["params"][0] = new_parameter
+                if staged["new_state"] is not None:
+                    self.optimizer.state[new_parameter] = staged["new_state"]
+                optimizable_tensors[staged["name"]] = new_parameter
+        except Exception:
+            for staged in staged_groups:
+                self.optimizer.state.pop(staged["new_parameter"], None)
+                staged["group"]["params"][0] = staged["old_parameter"]
+                if staged["had_state"]:
+                    self.optimizer.state[staged["old_parameter"]] = staged["old_state"]
+            raise
 
         return optimizable_tensors
 
@@ -453,6 +473,25 @@ class GaussianModel:
             "rotation": new_rotation,
         }
 
+        final_count = int(self.get_xyz.shape[0]) + int(new_xyz.shape[0])
+        tensor_device = self.get_xyz.device
+        new_xyz_gradient_accum = torch.zeros(
+            (final_count, 1),
+            device=tensor_device,
+        )
+        new_denom = torch.zeros((final_count, 1), device=tensor_device)
+        new_max_radii2D = torch.zeros((final_count), device=tensor_device)
+        updated_kf_ids = (
+            torch.cat((self.unique_kfIDs, new_kf_ids)).int()
+            if new_kf_ids is not None
+            else self.unique_kfIDs
+        )
+        updated_n_obs = (
+            torch.cat((self.n_obs, new_n_obs)).int()
+            if new_n_obs is not None
+            else self.n_obs
+        )
+
         optimizable_tensors = self.cat_tensors_to_optimizer(d)
         self._xyz = optimizable_tensors["xyz"]
         self._features_dc = optimizable_tensors["f_dc"]
@@ -461,13 +500,11 @@ class GaussianModel:
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"]
 
-        self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
-        self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
-        self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
-        if new_kf_ids is not None:
-            self.unique_kfIDs = torch.cat((self.unique_kfIDs, new_kf_ids)).int()
-        if new_n_obs is not None:
-            self.n_obs = torch.cat((self.n_obs, new_n_obs)).int()
+        self.xyz_gradient_accum = new_xyz_gradient_accum
+        self.denom = new_denom
+        self.max_radii2D = new_max_radii2D
+        self.unique_kfIDs = updated_kf_ids
+        self.n_obs = updated_n_obs
 
     def densify_and_split(self, grads, grad_threshold, scene_extent, N=2):
         n_init_points = self.get_xyz.shape[0]
